@@ -1506,3 +1506,26 @@ Entre-temps (par l'utilisateur) : activation de ifupdown-wait-online.service
 19.3 git init -b main ; git add -A
   Vérifié avec "git status --short --ignored" : 22 fichiers suivis,
   .env bien ignoré (!!).
+19.4 Identité Git, clé SSH, création du dépôt (utilisateur)
+  - git config --global user.name / user.email (adresse "noreply" de
+    GitHub, pour ne pas publier la vraie adresse e-mail).
+  - ssh-keygen -t ed25519 (avec phrase de passe), clé publique ajoutée
+    dans GitHub > Settings > SSH and GPG keys ; ssh -T git@github.com OK.
+  - Dépôt public "serveur-maison" créé VIDE (ni README, ni licence).
+19.5 Premier commit et push (utilisateur)
+  git commit -m "Serveur maison : Jellyfin, Navidrome, seedbox sous VPN"
+  git remote add origin git@github.com:<pseudo>/serveur-maison.git
+  git push -u origin main
+  BUG 1 : "ERROR: Repository not found."
+    Cause : l'URL contenait encore "TonPseudo", le texte d'exemple.
+    Solution : git remote set-url origin git@github.com:<vrai pseudo>/...
+  BUG 2 : même erreur après correction.
+    Cause : faute de frappe dans le pseudo (saoos au lieu de sooas).
+    Diagnostic : "ssh -T git@github.com" répond "Hi <pseudo>!" = le VRAI
+    nom du compte -> comparer avec "git remote -v".
+    Leçon : GitHub répond "not found" (et non "accès refusé") même quand
+    le dépôt existe mais que l'URL est fausse : il ne révèle pas quels
+    dépôts existent.
+  Résultat : push OK ; "git status -sb" -> main...origin/main (synchronisé),
+  22 fichiers publiés, .env absent du dépôt.
+ETAPE 19 TERMINEE.
