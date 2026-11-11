@@ -8,9 +8,8 @@ Un vieux ThinkPad recyclé en serveur multimédia allumé 24h/24 :
   **kill switch** : si le VPN tombe, qBittorrent n'a plus aucun accès à internet,
   et aucune fuite d'IP (IPv4 ou IPv6) n'est possible.
 
-Projet réalisé pas à pas par un débutant, en apprenant chaque notion.
-Le journal complet (commandes, explications, **bugs rencontrés et solutions**)
-est dans [`HISTORIQUE.txt`](HISTORIQUE.txt).
+Projet réalisé pas à pas en s'aidant de claude code, dont j'ai fais réaliser un historique des
+differentes commandes et bugs rencontrés tout du long. Il est disponible ici > [`HISTORIQUE.txt`](HISTORIQUE.txt).
 
 ## Matériel
 
