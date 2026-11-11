@@ -1,0 +1,261 @@
+==========================================================================
+ AIDE-MEMOIRE DU SERVEUR MAISON
+ Quoi faire QUAND quelque chose ne va pas. Le détail et le "pourquoi" de
+ chaque réglage sont dans HISTORIQUE.txt (chercher le numéro d'ETAPE).
+==========================================================================
+
+Toutes les commandes se tapent sur le serveur, en SSH depuis le PC :
+    ssh saaos@192.168.1.28        (à la maison)
+    ssh saaos@tx1c3               (de l'extérieur, via Tailscale)
+Et presque toutes depuis le dossier du projet :
+    cd ~/serveur-maison
+
+--------------------------------------------------------------------------
+ 0. LA METHODE (à appliquer AVANT de taper quoi que ce soit)
+--------------------------------------------------------------------------
+  1. Qu'est-ce qui ne marche pas EXACTEMENT ? (une appli ? toutes ?
+     seulement depuis l'extérieur ? depuis quand ?)
+  2. Ça tourne ?            -> docker ps
+  3. Qu'est-ce qu'il dit ?  -> docker logs <nom> --tail 50
+  4. Changer UNE chose à la fois, puis retester.
+  5. Noter dans HISTORIQUE.txt ce qui s'est passé (même court).
+
+  Lire un message d'erreur : la DERNIERE ligne dit souvent "quoi", les
+  lignes juste au-dessus disent "pourquoi". Copier la phrase dans un
+  moteur de recherche marche très souvent.
+
+--------------------------------------------------------------------------
+ 1. LE BILAN DE SANTE (2 minutes, à faire de temps en temps)
+--------------------------------------------------------------------------
+  docker ps
+      -> 6 lignes : caddy, qbittorrent, jellyfin, navidrome, gluetun,
+         duckdns, toutes "Up". gluetun et jellyfin : "(healthy)".
+  findmnt /mnt/medias ; findmnt /mnt/telechargements
+      -> chaque commande affiche une ligne. RIEN = disque absent (voir 5).
+  df -h / /mnt/medias /mnt/telechargements
+      -> colonne "Uti%" : s'inquiéter au-delà de 90 %.
+  systemctl --failed
+      -> "0 loaded units listed" = aucun service en panne.
+  docker exec qbittorrent curl -s https://ifconfig.co
+      -> une IP qui n'est PAS celle de la box (voir 2).
+
+  Rappel : à chaque connexion SSH, une ligne s'affiche toute seule.
+  Verte = rien à faire. Jaune = elle dit quoi faire.
+
+--------------------------------------------------------------------------
+ 2. "Y A-T-IL UNE FUITE D'IP ?" (qBittorrent sort-il bien par le VPN ?)
+--------------------------------------------------------------------------
+  curl -4 -s https://ifconfig.co                         -> IP de la box
+      (-4 OBLIGATOIRE : sans lui, le serveur répond en IPv6 et la
+       comparaison ne prouve plus rien)
+  docker exec qbittorrent curl -s https://ifconfig.co    -> IP du VPN
+      Les deux doivent être DIFFERENTES. Si elles sont identiques :
+      ARRET IMMEDIAT ->  docker stop qbittorrent   puis chercher (ETAPE 7-9).
+  docker exec qbittorrent curl -6 -s --max-time 5 https://ifconfig.co
+      -> doit ECHOUER (rien ne s'affiche) = pas de fuite IPv6.
+
+  Note : si le VPN est en panne, la 2e commande échoue au lieu d'afficher
+  une IP. C'est NORMAL : c'est le kill switch qui bloque tout.
+  Si ifconfig.co ne répond pas : essayer https://icanhazip.com
+
+--------------------------------------------------------------------------
+ 3. JELLYFIN OU NAVIDROME NE REPOND PAS
+--------------------------------------------------------------------------
+  Question clé : ça marche À LA MAISON ? Tester dans le navigateur du PC :
+      http://192.168.1.28:8096      (Jellyfin)
+      http://192.168.1.28:4533      (Navidrome)
+
+  A) NE MARCHE PAS NON PLUS À LA MAISON -> problème de l'appli elle-même
+     docker ps                          -> le conteneur est-il "Up" ?
+     docker logs jellyfin --tail 50     (ou navidrome)
+     docker compose restart jellyfin    -> redémarrer juste celui-là
+     Si "Exited" en boucle : un disque est souvent absent (voir 5).
+
+  B) MARCHE À LA MAISON, PAS DE L'EXTERIEUR -> problème du chemin d'accès
+     (internet -> box -> Caddy -> appli). Vérifier dans l'ordre :
+     1. DuckDNS pointe sur la bonne IP ?
+          curl -4 -s https://ifconfig.co           -> IP actuelle de la box
+          getent hosts <sous-domaine>.duckdns.org  -> doit être la même
+          Sinon : docker logs duckdns --tail 20 ; docker compose restart duckdns
+     2. Caddy va bien ?
+          docker logs caddy --tail 30
+          Chercher "error". Problème de certificat = souvent ports 80/443
+          plus redirigés par la box.
+     3. La Livebox redirige toujours 80 et 443 vers 192.168.1.28 ?
+          (interface web 192.168.1.1 > Réseau > NAT/PAT). Une mise à jour
+          ou une réinitialisation de la box peut effacer ces règles.
+
+  Bibliothèque vide / nouveau film invisible :
+     Le fichier est-il au bon endroit ? ls /mnt/medias/films
+     Jellyfin : Tableau de bord > Bibliothèques > Scanner.
+     Navidrome scanne seul toutes les heures (ND_SCANSCHEDULE=1h).
+
+--------------------------------------------------------------------------
+ 4. QBITTORRENT NE TELECHARGE PLUS / INTERFACE INACCESSIBLE
+--------------------------------------------------------------------------
+  Interface web : http://192.168.1.28:8080 (maison) ou via Tailscale.
+  JAMAIS depuis internet (c'est voulu).
+
+  docker ps                         -> gluetun "(healthy)" ? qbittorrent "Up" ?
+  docker logs gluetun --tail 40     -> le VPN est-il connecté ?
+      "Public IP address is ..." = connecté.
+      "restarting VPN" répété sans fin = Proton refuse : clé WireGuard
+      expirée ? (nouvelle clé sur account.protonvpn.com, à mettre dans
+      .env avec nano, puis docker compose up -d)
+
+  Le port ouvert par Proton = le port de qBittorrent ?
+      docker exec gluetun wget -qO- http://127.0.0.1:8000/v1/portforward
+      docker exec qbittorrent grep 'Session\\Port' /config/qBittorrent/qBittorrent.conf
+      -> les deux nombres doivent être identiques.
+  La surveillance automatique (toutes les 5 min) répare ça seule.
+  Voir ce qu'elle a fait :
+      journalctl -u surveillance-port --since today
+
+  qbittorrent "Created" ou absent alors que gluetun va bien :
+      docker compose up -d
+
+  APRES avoir redémarré ou recréé gluetun, il faut TOUJOURS recréer
+  qbittorrent aussi (il partage sa carte réseau) :
+      docker compose up -d --force-recreate gluetun qbittorrent
+
+--------------------------------------------------------------------------
+ 5. UN DISQUE N'EST PAS MONTE
+--------------------------------------------------------------------------
+  Symptômes : bibliothèque vide, conteneur qui ne démarre pas, sauvegarde
+  en échec ("n'est pas monté").
+  findmnt /mnt/medias ; findmnt /mnt/telechargements   -> lequel manque ?
+  lsblk -f            -> le disque est-il vu par le système ? (sdb, sdc...)
+      Non vu : câble USB / boîtier / dock. Débrancher-rebrancher.
+  sudo dmesg | tail -30   -> messages du noyau (erreurs USB, disque)
+  sudo mount -a           -> monte tout ce qui est prévu dans /etc/fstab
+  Puis relancer les conteneurs pour qu'ils voient le disque :
+      docker compose up -d --force-recreate
+
+  NE JAMAIS copier de fichiers dans /mnt/medias quand le disque n'est pas
+  monté : ils iraient sur le petit SSD système (128 Go) et le rempliraient.
+
+--------------------------------------------------------------------------
+ 6. APRES UNE COUPURE DE COURANT OU UN REDEMARRAGE
+--------------------------------------------------------------------------
+  Tout doit repartir seul (testé à l'ETAPE 18). Attendre 2 minutes, puis
+  faire le bilan de santé (section 1) + le test de fuite (section 2).
+  Si des conteneurs manquent :
+      docker compose up -d
+  Redémarrer volontairement :   sudo reboot
+  Éteindre proprement :         sudo poweroff
+
+--------------------------------------------------------------------------
+ 7. MODIFIER UNE CONFIGURATION (compose.yaml, Caddyfile, .env)
+--------------------------------------------------------------------------
+  1. Avant : git status       -> partir d'un état propre
+  2. nano compose.yaml        (Ctrl+O Entrée = enregistrer, Ctrl+X = quitter)
+  3. docker compose config --quiet
+       -> AUCUN message = syntaxe correcte. Sinon : la ligne est indiquée.
+  4. docker compose up -d     -> ne recrée QUE ce qui a changé
+     Pour le Caddyfile :  docker compose restart caddy
+  5. Tester. Si ça casse : revenir à la version d'avant
+       git diff                  -> voir ce qui a changé
+       git checkout -- compose.yaml   -> annuler les modifs non commitées
+  6. Si ça marche : git add -A ; git commit -m "..." ; git push
+  Le .env n'est pas suivi par git : en faire une copie avant d'y toucher
+       cp .env .env.avant ; (puis supprimer .env.avant une fois validé)
+
+--------------------------------------------------------------------------
+ 8. MISES A JOUR
+--------------------------------------------------------------------------
+  Debian (sécurité) : AUTOMATIQUE chaque nuit. Le reste :
+      sudo apt update && sudo apt full-upgrade
+  Si la ligne jaune dit "Redémarrage nécessaire" :  sudo reboot
+  Conteneurs (une fois par mois, la ligne jaune le rappelle) :
+      ~/serveur-maison/maintenance/mise-a-jour.sh
+      Le script vérifie la sauvegarde, met à jour, et affiche à la fin
+      la commande exacte pour revenir en arrière si besoin.
+
+--------------------------------------------------------------------------
+ 9. SAUVEGARDES (restic, chaque nuit à 04h30)
+--------------------------------------------------------------------------
+  Ce qui est sauvegardé : les CONFIGURATIONS (/srv/appdata, ce dossier,
+  quelques fichiers de /etc). PAS les films/musiques (trop gros).
+  Le mot de passe est dans ~/.config/restic/mot-de-passe : SANS LUI LES
+  SAUVEGARDES SONT ILLISIBLES. En garder une copie hors du serveur
+  (gestionnaire de mots de passe).
+
+  Avant toute commande restic, définir ces 2 variables :
+      export RESTIC_REPOSITORY=/mnt/telechargements/sauvegardes/restic
+      export RESTIC_PASSWORD_FILE=~/.config/restic/mot-de-passe
+
+  La dernière sauvegarde s'est-elle bien passée ?
+      journalctl -u sauvegarde | grep -E 'succès|ERREUR|Failed' | tail -1
+      -> "Sauvegarde terminée avec succès." avec la date du jour
+      systemctl list-timers sauvegarde.timer   -> date de la prochaine
+  Liste des sauvegardes :         restic snapshots
+  Lancer une sauvegarde maintenant : sudo systemctl start sauvegarde.service
+
+  RECUPERER un fichier (exemple : le Caddyfile d'hier) :
+      restic restore latest --target ~/restau --include /home/saaos/serveur-maison/Caddyfile
+      ls -R ~/restau        -> le fichier est là, dans son arborescence
+      (comparer, recopier ce qu'il faut, puis)  rm -r ~/restau
+  RECUPERER les données d'une appli (ex. Jellyfin) : l'ARRETER d'abord
+      docker compose stop jellyfin
+      restic restore latest --target ~/restau --include /srv/appdata/jellyfin
+      (remplacer /srv/appdata/jellyfin par ~/restau/srv/appdata/jellyfin)
+      docker compose start jellyfin ; rm -r ~/restau
+  "latest" peut être remplacé par l'identifiant d'un snapshot plus ancien.
+
+--------------------------------------------------------------------------
+ 10. FAIL2BAN (bannit les robots qui essaient des mots de passe)
+--------------------------------------------------------------------------
+  sudo fail2ban-client status caddy-auth    -> IP actuellement bannies
+  Débannir (par exemple ton téléphone après des erreurs de saisie) :
+      sudo fail2ban-client set caddy-auth unbanip <IP>
+  Les IP de la maison et de Tailscale ne sont jamais bannies.
+
+--------------------------------------------------------------------------
+ 11. OU SONT LES JOURNAUX ?
+--------------------------------------------------------------------------
+  Un conteneur :            docker logs <nom> --tail 50
+      en direct (Ctrl+C pour sortir) : docker logs -f <nom>
+  Un service systemd :      journalctl -u <nom> --since today
+      (sauvegarde, surveillance-port, docker, fail2ban, tailscaled)
+  Le démarrage actuel :     journalctl -b
+  Les erreurs seulement :   journalctl -b -p err
+  Accès web (Caddy) :       /srv/appdata/caddy/logs/access.log
+
+--------------------------------------------------------------------------
+ 12. GIT (garder GitHub à jour)
+--------------------------------------------------------------------------
+  git status                       qu'est-ce qui a changé ?
+  git diff                         le détail des changements
+  git add -A                       tout préparer
+  git commit -m "ce que j'ai fait" la "photo"
+  git push                         envoyer (demande la phrase de passe SSH)
+  git log --oneline                l'historique des commits
+  git pull --rebase                récupérer ce qui a été modifié SUR LE
+                                   SITE GitHub (à faire AVANT de modifier
+                                   sur le serveur si on a édité en ligne)
+  Push refusé, "ont divergé" = GitHub a des commits que le serveur n'a
+  pas -> git add -A ; git commit -m "..." ; git pull --rebase ; git push
+
+--------------------------------------------------------------------------
+ 13. LES GESTES INTERDITS
+--------------------------------------------------------------------------
+  - Rediriger le port 8080 (qBittorrent) sur la Livebox.
+  - Retirer  network_mode: "service:gluetun"  de qbittorrent dans
+    compose.yaml (= qBittorrent sortirait par la box, SANS VPN).
+  - Publier le .env (token DuckDNS, clé WireGuard) : le vérifier avec
+    git status avant chaque commit ; il ne doit jamais y apparaître.
+  - Ecrire dans /mnt/... quand le disque n'est pas monté (voir 5).
+  - Taper une commande trouvée sur internet sans comprendre ce qu'elle
+    fait, surtout avec sudo ou rm.
+
+--------------------------------------------------------------------------
+ ADRESSES UTILES
+--------------------------------------------------------------------------
+  Serveur (réseau local) : 192.168.1.28    Tailscale : tx1c3
+  Livebox                : http://192.168.1.1
+  Jellyfin  local        : http://192.168.1.28:8096
+  Navidrome local        : http://192.168.1.28:4533
+  qBittorrent            : http://192.168.1.28:8080  (jamais internet)
+  Proton VPN (clés)      : https://account.protonvpn.com
+  DuckDNS                : https://www.duckdns.org
+  Tailscale (appareils)  : https://login.tailscale.com

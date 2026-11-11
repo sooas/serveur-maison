@@ -1529,3 +1529,33 @@ Entre-temps (par l'utilisateur) : activation de ifupdown-wait-online.service
   Résultat : push OK ; "git status -sb" -> main...origin/main (synchronisé),
   22 fichiers publiés, .env absent du dépôt.
 ETAPE 19 TERMINEE.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 20 - Aide-mémoire de dépannage (AIDE-MEMOIRE.txt)
+--------------------------------------------------------------------------
+Constat de l'utilisateur : "j'ai compris les bases, mais au moins 50 % des
+commandes, je n'aurais jamais pu les faire moi-même". HISTORIQUE.txt est
+un JOURNAL (ce qui a été fait), pas un MANUEL (quoi faire quand ça casse).
+-> AIDE-MEMOIRE.txt : organisé par SITUATION (fuite VPN ?, appli qui ne
+   répond pas, disque absent, sauvegarde, restauration...), ~20 commandes.
+Chaque commande nouvelle a été testée sur le serveur (Claude). 2 erreurs
+trouvées dans le premier jet et corrigées :
+  BUG 1 (grave) : test de fuite "curl -s https://ifconfig.co" sur l'hôte
+    -> renvoie l'IPv6 de la box (2a01:...), pas l'IPv4. Comparée à l'IP
+    du VPN, elle est TOUJOURS différente = faux "pas de fuite", même en
+    cas de vraie fuite. Correction : curl -4 (forcer l'IPv4).
+    Leçon : un test qui ne peut jamais échouer ne prouve rien.
+  BUG 2 : "systemctl status sauvegarde.service" n'affiche le résultat que
+    si la sauvegarde a tourné DEPUIS le dernier démarrage. Remplacé par
+    une recherche dans le journal (journalctl -u sauvegarde | grep ...).
+Suite prévue : exercices de panne (Claude provoque, l'utilisateur répare
+avec l'aide-mémoire, sans aide sauf blocage).
+  BUG (push de l'étape 20) : "Votre branche et 'origin/main' ont divergé".
+    Cause : README modifié directement sur le site GitHub (commit
+    de55172) pendant qu'un commit local (fe21bff) attendait d'être
+    poussé. Chaque côté avait un commit que l'autre n'avait pas ;
+    Git refuse le push pour ne pas effacer la modification en ligne.
+    Solution : git commit (tout photographier) puis git pull --rebase
+    (récupère le commit de GitHub et rejoue les commits locaux par-dessus)
+    puis git push. Aucun conflit : fichiers différents.
+    Règle ajoutée à AIDE-MEMOIRE section 12.
