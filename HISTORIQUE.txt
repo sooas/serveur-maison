@@ -1559,3 +1559,51 @@ avec l'aide-mémoire, sans aide sauf blocage).
     (récupère le commit de GitHub et rejoue les commits locaux par-dessus)
     puis git push. Aucun conflit : fichiers différents.
     Règle ajoutée à AIDE-MEMOIRE section 12.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 21 - Exercices de panne (l'utilisateur répare seul)
+--------------------------------------------------------------------------
+EXERCICE 1 (facile) - "Navidrome injoignable depuis le téléphone"
+  Panne (Claude, en secret) : docker stop navidrome  (19:54 heure de Paris)
+  Démarche de l'utilisateur :
+    docker ps -> navidrome absent de la liste -> relancé. Réparé.
+  Rappel (méthode, étape 3) : comprendre la CAUSE avant de passer à autre
+    chose, sinon la panne revient.
+    docker logs navidrome --tail 40 -> l'utilisateur identifie :
+    "Stopping HTTP server" ... base fermée ... "Navidrome stopped, bye."
+    = arrêt PROPRE et ORDONNÉ = arrêt demandé, pas un plantage.
+  Notions acquises :
+    - docker ps -a : montre aussi les conteneurs arrêtés + code de sortie
+      (Exited (0) = arrêt propre ; autre nombre = plantage).
+    - Heures des journaux en UTC (suffixe Z) : Paris = UTC+1 l'hiver,
+      UTC+2 l'été. 18:54:04Z = 19:54:04 à Paris.
+    - Deux "bye" dans le journal : 17:55Z = redémarrage du serveur,
+      18:54Z = l'exercice. Croiser avec les événements connus.
+    - restart: unless-stopped -> Docker ne relance PAS un conteneur
+      arrêté volontairement (même après reboot) ; il relance un conteneur
+      qui a planté.
+  Résultat : réparé ; HTTP 302 en local et en HTTPS (vérifié par Claude).
+
+EXERCICE 2 (moyen) - "Jellyfin : page d'erreur chez un ami"
+  Panne (Claude, en secret) : Caddyfile, ligne 35
+    reverse_proxy jellyfin:8096  ->  reverse_proxy jellyfin:8069
+    puis docker compose restart caddy. docker ps : TOUT est "Up".
+  Démarche de l'utilisateur :
+    1. Local (http://192.168.1.28:8096) OK, domaine DuckDNS KO
+       -> la panne est sur le chemin internet -> box -> Caddy -> appli.
+    2. Journaux duckdns normaux -> IP du domaine hors de cause.
+    3. Hypothèse "ports HTTPS" -> abandonnée grâce au code d'erreur :
+       502 Bad Gateway = Caddy A REÇU la requête (box, ports, certificat
+       OK) mais n'a pas pu joindre l'appli derrière lui.
+    4. git status -> Caddyfile modifié -> port 8069 au lieu de 8096,
+       corrigé, Caddy redémarré. Site de nouveau joignable.
+  Vérifié par Claude : Caddyfile identique au dernier commit (git diff
+    vide), le conteneur lit bien 8096, HTTPS externe -> 302.
+  Notions acquises :
+    - Le CODE d'erreur HTTP localise la panne : 502 = proxy OK, appli
+      derrière injoignable ; délai dépassé = rien n'a répondu (box/ports).
+    - Comparer deux services qui partagent le même chemin (Navidrome
+      marche ? alors box/ports/Caddy sont hors de cause).
+    - Git sert aussi au DIAGNOSTIC : git status = "qu'est-ce qui a changé
+      depuis la dernière version qui marchait ?" ; git diff = la ligne
+      exacte ; git checkout -- <fichier> = retour à la version validée.
