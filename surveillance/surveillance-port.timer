@@ -1,0 +1,16 @@
+# ==========================================================================
+#  Minuterie : lance surveillance-port.service toutes les 5 minutes
+# ==========================================================================
+[Unit]
+Description=Surveillance du port VPN toutes les 5 minutes
+
+[Timer]
+# 1er passage 5 min après le démarrage (laisse Docker et le VPN s'installer)
+OnBootSec=5min
+# puis 5 min après le début du passage précédent
+OnUnitActiveSec=5min
+# précision : systemd peut décaler de 30 s pour grouper les réveils
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,24 @@
+// ==========================================================================
+//  APT : NOS réglages de unattended-upgrades (QUOI et COMMENT)
+//  À installer dans /etc/apt/apt.conf.d/52serveur-maison
+//  Lu APRÈS 50unattended-upgrades (fichier du paquet, à ne pas modifier :
+//  il serait remplacé par les mises à jour) -> nos valeurs l'emportent.
+//
+//  QUOI : on garde la liste par défaut de Debian (Origins-Pattern du 50) =
+//  dépôts Debian officiels, dont trixie-security. Les dépôts Docker et
+//  Tailscale n'y sont PAS : ils restent manuels (voir maintenance/).
+// ==========================================================================
+
+// Jamais de redémarrage automatique : serveur 24h/24, on choisit le moment.
+// Si un nouveau noyau l'exige, /var/run/reboot-required apparaît
+// (signalé par maintenance/mise-a-jour.sh).
+Unattended-Upgrade::Automatic-Reboot "false";
+
+// Ménage : anciens noyaux (le SSD système fait 128 Go) et dépendances
+// devenues inutiles.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Une coupure de courant pendant une installation ne doit pas laisser
+// la moitié des paquets à moitié installés : on installe par petits lots.
+Unattended-Upgrade::MinimalSteps "true";

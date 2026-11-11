@@ -1,0 +1,15 @@
+# ==========================================================================
+#  .gitignore : fichiers que Git doit IGNORER (jamais envoyés sur GitHub)
+# ==========================================================================
+
+# Secrets : ne jamais publier (le modèle .env.exemple, lui, est publié)
+.env
+
+# Sécurité supplémentaire : tout fichier de clé ou de mot de passe
+*.key
+*.pem
+mot-de-passe*
+
+# Fichiers temporaires des éditeurs (nano crée des .swp / ~ en cas de crash)
+*.swp
+*~

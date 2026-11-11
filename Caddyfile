@@ -1,0 +1,43 @@
+# ==========================================================================
+#  Caddy - reverse proxy HTTPS
+#  {$NOM} = variable d'environnement (définie dans .env, jamais publiée).
+#  Caddy obtient et renouvelle seul les certificats Let's Encrypt.
+# ==========================================================================
+
+# --- Options globales ---
+{
+	servers {
+		# HTTP/1.1 et HTTP/2 uniquement : HTTP/3 utiliserait l'UDP 443,
+		# que la box ne redirige pas (moins de ports ouverts).
+		protocols h1 h2
+	}
+}
+
+# --- Snippet réutilisable : journal d'accès (lu par fail2ban) ---
+# Un "snippet" (nom entre parenthèses) se définit une fois et s'insère
+# avec "import". Format JSON : une ligne par requête, avec client_ip,
+# uri et status (401 = mot de passe refusé).
+(journal) {
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB   # nouveau fichier tous les 20 Mo
+			roll_keep 5       # on garde les 5 derniers
+		}
+		format json
+	}
+}
+
+# --- Jellyfin ---
+{$JELLYFIN_SUB}.duckdns.org {
+	import journal
+	# Navigateur : "n'utilise plus que HTTPS pour ce site pendant 1 an"
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy jellyfin:8096
+}
+
+# --- Navidrome ---
+{$NAVIDROME_SUB}.duckdns.org {
+	import journal
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy navidrome:4533
+}

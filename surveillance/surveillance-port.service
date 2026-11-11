@@ -1,0 +1,19 @@
+# ==========================================================================
+#  Service : un passage de la surveillance du port VPN
+#  À installer dans /etc/systemd/system/ ; lancé par surveillance-port.timer
+# ==========================================================================
+[Unit]
+Description=Surveillance de la redirection de port VPN (Gluetun -> qBittorrent)
+After=docker.service
+
+[Service]
+# oneshot = le script fait son travail puis se termine (pas un démon)
+Type=oneshot
+# Pas root : saaos est dans le groupe docker, ça suffit
+User=saaos
+# systemd crée /var/lib/surveillance-port (propriétaire saaos) et le donne
+# au script via $STATE_DIRECTORY : date de la dernière relance du tunnel
+StateDirectory=surveillance-port
+ExecStart=/home/saaos/serveur-maison/surveillance/surveillance-port.sh
+# Garde-fou : un passage ne doit jamais rester bloqué
+TimeoutStartSec=5min

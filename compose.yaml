@@ -1,0 +1,173 @@
+# ==========================================================================
+#  Serveur maison - définition des conteneurs
+#  Les secrets sont dans .env (jamais publié) : ${NOM} y fait référence.
+# ==========================================================================
+services:
+
+  # ------------------------------------------------------------------------
+  # GLUETUN : tunnel VPN Proton (WireGuard) + pare-feu = kill switch
+  # ------------------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    environment:
+      - TZ=Europe/Paris
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - SERVER_COUNTRIES=Switzerland,Netherlands   # tirage au sort parmi les 2
+      - PORT_FORWARD_ONLY=on
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- --retry-connrefused --tries=0 --waitretry=10 --post-data "json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+      # Serveur de contrôle (API sans mot de passe) : localhost UNIQUEMENT.
+      # Par défaut (:8000) tout conteneur du réseau Docker, Caddy compris,
+      # pouvait arrêter le VPN. Utilisé par surveillance/surveillance-port.sh
+      - HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000
+    ports:
+      - 192.168.1.28:8080:8080   # interface web qBittorrent (réseau local)
+    volumes:
+      - /srv/appdata/gluetun:/gluetun
+      - ./gluetun/auth/config.toml:/gluetun/auth/config.toml:ro   # droits API
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Paris
+      - WEBUI_PORT=8080
+    volumes:
+      - /srv/appdata/qbittorrent:/config
+      # FAIL-SAFE : on monte des SOUS-DOSSIERS qui n'existent que sur les
+      # disques externes, avec create_host_path: false. Disque absent ->
+      # le conteneur REFUSE de démarrer au lieu d'écrire sur le SSD système
+      # (le dossier /mnt/telechargements, lui, existe toujours, vide).
+      - type: bind
+        source: /mnt/telechargements/incomplets
+        target: /telechargements/incomplets
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/telechargements/termines
+        target: /telechargements/termines
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/medias/films
+        target: /medias/films
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/medias/series
+        target: /medias/series
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/medias/musique
+        target: /medias/musique
+        bind: {create_host_path: false}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------
+  # JELLYFIN : films et series (hors VPN, acces local pour l'instant)
+  # ------------------------------------------------------------------------
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: 1000:1000
+    group_add:
+      - "992"          # groupe render : acces a la puce graphique
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - TZ=Europe/Paris
+    ports:
+      - 192.168.1.28:8096:8096
+    volumes:
+      - /srv/appdata/jellyfin/config:/config
+      - /srv/appdata/jellyfin/cache:/cache
+      # FAIL-SAFE (voir qbittorrent) : disque absent -> Jellyfin ne démarre
+      # pas, au lieu de voir une bibliothèque vide et de l'effacer.
+      - type: bind
+        source: /mnt/medias/films
+        target: /medias/films
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /mnt/medias/series
+        target: /medias/series
+        read_only: true
+        bind: {create_host_path: false}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------
+  # NAVIDROME : musique
+  # ------------------------------------------------------------------------
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    user: 1000:1000
+    environment:
+      - TZ=Europe/Paris
+      - ND_SCANSCHEDULE=1h
+      - ND_LOGLEVEL=info
+    ports:
+      - 192.168.1.28:4533:4533
+    volumes:
+      - /srv/appdata/navidrome:/data
+      # FAIL-SAFE (voir qbittorrent)
+      - type: bind
+        source: /mnt/medias/musique
+        target: /music
+        read_only: true
+        bind: {create_host_path: false}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------
+  # DUCKDNS : signale l'IP publique actuelle de la box à DuckDNS (5 min)
+  # ------------------------------------------------------------------------
+  duckdns:
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: duckdns
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Paris
+      - SUBDOMAINS=${JELLYFIN_SUB},${NAVIDROME_SUB}
+      - TOKEN=${DUCKDNS_TOKEN}
+      - UPDATE_IP=ipv4
+      - LOG_FILE=false
+    volumes:
+      - /srv/appdata/duckdns:/config
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------
+  # CADDY : reverse proxy HTTPS (seul service exposé sur internet, 80/443)
+  # ------------------------------------------------------------------------
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    user: 1000:1000
+    environment:
+      - JELLYFIN_SUB=${JELLYFIN_SUB}
+      - NAVIDROME_SUB=${NAVIDROME_SUB}
+    ports:
+      - 192.168.1.28:80:80
+      - 192.168.1.28:443:443
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/appdata/caddy/data:/data
+      - /srv/appdata/caddy/config:/config
+      - /srv/appdata/caddy/logs:/var/log/caddy   # journal lu par fail2ban
+    depends_on:
+      - jellyfin
+      - navidrome
+    restart: unless-stopped

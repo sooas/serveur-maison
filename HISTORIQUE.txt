@@ -1,0 +1,1508 @@
+==========================================================================
+ HISTORIQUE DU PROJET : SERVEUR MAISON (Jellyfin, Navidrome, Seedbox)
+==========================================================================
+Format : [DATE] ETAPE - description / commandes / problèmes / solutions
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 0 - Etat des lieux
+--------------------------------------------------------------------------
+Matériel :
+  - ThinkPad X1 Carbon 3e gen (sans batterie), dock OneLink Pro (Ethernet)
+  - SSD interne ADATA 128 Go : Debian 13 (Trixie), sans bureau graphique
+  - SSD Crucial X9 1 To (USB)          -> futur disque MEDIAS
+  - SSD Samsung 860 EVO 1 To (ex-PS4, boîtier SATA->USB) -> futur disque TELECHARGEMENTS
+  - RAM 7,6 Go
+
+Réseau :
+  - Livebox Orange, réseau local 192.168.1.0/24, passerelle 192.168.1.1
+  - IP du serveur (DHCP pour l'instant) : 192.168.1.28 sur l'adaptateur USB Ethernet
+  - IPv6 actif (à surveiller pour les fuites VPN)
+
+Constats :
+  - Docker, pare-feu (ufw/nftables) : non installés
+  - Disques externes : Crucial en NTFS (ancienne clé d'installation Windows
+    "ESD-ISO"), Samsung en NTFS. Les deux seront effacés et reformatés.
+
+Décisions prises :
+  - Installation par Docker / docker compose
+  - Kill switch VPN : qBittorrent derrière Gluetun (Proton VPN WireGuard,
+    redirection de port, Suisse en priorité)
+  - Accès extérieur : reverse proxy HTTPS + DuckDNS (Jellyfin, Navidrome)
+  - Interface qBittorrent : réseau local + Tailscale seulement
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 1 - Préparation des disques externes (effacement + ext4)
+--------------------------------------------------------------------------
+But : remplacer NTFS (format Windows, mal adapté aux permissions Linux et
+à Docker) par ext4, le format standard de Linux.
+Principe : table de partitions (GPT) -> partition -> système de fichiers.
+ATTENTION : sdb/sdc ne sont pas des noms fixes (ordre de branchement).
+Toujours vérifier avec lsblk avant toute commande destructrice.
+
+sudo apt update && sudo apt install -y parted
+    -> met à jour la liste des paquets puis installe parted (outil de
+       partitionnement, absent de l'installation de base).
+
+lsblk -o NAME,SIZE,MODEL
+    -> liste les disques pour identifier lequel est lequel
+       (sdc = Crucial X9 CT1000X9SSD9, sdb = Samsung 860 EVO ex-PS4).
+
+sudo wipefs -a /dev/sdc
+sudo wipefs -a /dev/sdb
+    -> efface toutes les signatures (anciennes partitions NTFS/Windows) :
+       les disques apparaissent vierges.
+
+sudo parted /dev/sdc --script mklabel gpt mkpart medias ext4 0% 100%
+sudo parted /dev/sdb --script mklabel gpt mkpart telechargements ext4 0% 100%
+    -> crée une table GPT et une partition unique sur tout le disque.
+       0%-100% laisse parted aligner la partition (performances SSD).
+
+sudo mkfs.ext4 -L medias -m 0 /dev/sdc1
+sudo mkfs.ext4 -L telechargements -m 0 /dev/sdb1
+    -> formate en ext4. -L = étiquette lisible. -m 0 = supprime les 5 %
+       réservés à root (inutiles sur un disque de données, ~46 Go gagnés).
+
+lsblk -o NAME,SIZE,FSTYPE,LABEL,MODEL
+    -> contrôle du résultat.
+
+Résultat : OK, aucune erreur.
+  sdc1  ext4  LABEL=medias           UUID=7bf0403a-19e4-4cdc-bb40-75e0f61429fa
+  sdb1  ext4  LABEL=telechargements  UUID=efb2dae1-d63e-4094-bb76-270c5488990e
+
+Anomalie mineure : le NOM DE PARTITION GPT (PARTLABEL) de sdb1 est "medias"
+au lieu de "telechargements" (commande parted probablement lancée deux fois).
+Sans conséquence : c'est l'étiquette ext4 (LABEL) et l'UUID qui servent.
+Correction facultative :
+  sudo parted /dev/sdb --script name 1 telechargements
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 2 - Montage automatique des disques (/etc/fstab)
+--------------------------------------------------------------------------
+Principe : sous Linux, un disque est "accroché" sur un dossier vide
+(point de montage). /etc/fstab liste les montages faits à chaque démarrage.
+On désigne les disques par UUID (fixe), jamais par sdb/sdc (variables).
+
+sudo mkdir -p /mnt/medias /mnt/telechargements
+    -> crée les deux points de montage.
+
+sudo cp /etc/fstab /etc/fstab.bak
+    -> sauvegarde de fstab avant modification (une erreur peut bloquer
+       le démarrage).
+
+echo 'UUID=7bf0...  /mnt/medias  ext4  defaults,noatime,nofail,x-systemd.device-timeout=10s 0 2' | sudo tee -a /etc/fstab
+echo 'UUID=efb2...  /mnt/telechargements  ext4  (mêmes options)  0 2' | sudo tee -a /etc/fstab
+    -> ajoute les deux lignes en fin de fstab. "sudo tee -a" car une
+       redirection ">>" ne serait pas exécutée en root.
+    Options :
+      noatime  = n'écrit pas la date de chaque lecture (moins d'usure SSD)
+      nofail   = le système démarre même si le disque USB est absent
+      x-systemd.device-timeout=10s = n'attend le disque que 10 s
+      0 2      = pas de dump ; vérification fsck après le disque système
+
+sudo findmnt --verify
+    -> vérifie la syntaxe de fstab sans rien monter.
+
+sudo systemctl daemon-reload
+sudo mount -a
+    -> systemd relit fstab, puis tout ce qui est listé est monté.
+
+sudo chown saaos:saaos /mnt/medias /mnt/telechargements
+    -> donne les disques à l'utilisateur saaos (au lieu de root) :
+       les conteneurs tourneront sous cette identité (moindre privilège).
+
+sudo parted /dev/sdb --script name 1 telechargements
+    -> corrige le nom de partition GPT du Samsung (anomalie de l'étape 1).
+
+Résultat : OK, aucune erreur.
+  /dev/sdc1 -> /mnt/medias           916 Go dispo, rw,noatime
+  /dev/sdb1 -> /mnt/telechargements  916 Go dispo, rw,noatime
+Remarque : l'option "stripe=8191" apparaît sur le Samsung. Elle vient du
+boîtier USB "Essentiel B" qui déclare une taille d'écriture optimale
+inhabituelle. ext4 l'a prise en compte au formatage. Sans conséquence.
+Test de redémarrage : à faire après l'étape 3.
+
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 3 - Serveur allumé 24h/24 (aucune mise en veille)
+--------------------------------------------------------------------------
+But : le PC reste allumé écran rabattu, sans jamais se mettre en veille,
+et ne consacre pas de ressources à des fonctions inutiles.
+
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo nano /etc/systemd/logind.conf.d/capot.conf
+    -> crée un fichier "drop-in" : un petit fichier qui surcharge le
+       réglage principal (/etc/systemd/logind.conf) sans le modifier.
+       Contenu :
+         [Login]
+         HandleLidSwitch=ignore
+         HandleLidSwitchExternalPower=ignore
+         HandleLidSwitchDocked=ignore
+       logind = service systemd qui gère les sessions et les boutons
+       (capot, alimentation). "ignore" = fermer l'écran ne fait rien,
+       sur batterie, sur secteur ou sur le dock.
+    Petite erreur : "sudo nano /etc/systemd/logind.conf.d" (ouverture du
+    dossier au lieu du fichier). Sans conséquence, corrigé juste après.
+
+nano -v /etc/systemd/logind.conf
+    -> consultation en lecture seule (-v) du fichier d'origine, pour
+       voir les réglages par défaut (lignes commentées par #).
+
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+    -> "mask" relie ces cibles à /dev/null : aucune veille ni
+       hibernation n'est possible, même demandée par erreur.
+       (Annulable avec "systemctl unmask".)
+
+sudo systemctl set-default multi-user.target
+    -> démarre en mode texte multi-utilisateur (pas d'interface
+       graphique) : économie de RAM et de CPU.
+
+sudo systemctl disable --now bluetooth.service wpa_supplicant.service
+    -> arrête et désactive le Bluetooth et le gestionnaire Wi-Fi
+       (wpa_supplicant), inutiles : le serveur est en Ethernet.
+
+sudo nano /etc/default/grub
+    -> ajout de "consoleblank=60" dans GRUB_CMDLINE_LINUX_DEFAULT :
+       l'écran interne s'éteint après 60 s d'inactivité (économie
+       d'énergie, moins de chauffe, pas d'usure de la dalle).
+sudo update-grub
+    -> régénère la configuration de démarrage pour appliquer ce réglage.
+
+sudo reboot
+    -> redémarrage de test.
+
+Vérifications après redémarrage (OK) :
+  - Disques montés automatiquement : /dev/sdc1 -> /mnt/medias,
+    /dev/sdb1 -> /mnt/telechargements (test fstab de l'étape 2 validé)
+  - sleep/suspend/hibernate/hybrid-sleep : masked
+  - Bluetooth, wpa_supplicant : disabled ; cible par défaut : multi-user
+  - Noyau lancé avec consoleblank=60
+  - Gestion d'énergie USB : adaptateur Ethernet du dock ("ThinkPad Dock
+    Giga"), Crucial X9 et boîtier Samsung ("Essentiel B") sur "on"
+    = jamais mis en sommeil par le noyau. Rien à corriger.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 4 - Adresse IP fixe (bail DHCP statique sur la Livebox)
+--------------------------------------------------------------------------
+But : le serveur garde toujours la même adresse locale, indispensable
+pour la redirection de ports (accès depuis internet) faite plus tard.
+
+Principe : DHCP = service de la box qui prête automatiquement une
+adresse IP à chaque appareil, pour une durée limitée (le "bail").
+Un bail statique associe définitivement une IP à une adresse MAC
+(identifiant physique de la carte réseau).
+Choix : réservation côté box plutôt qu'IP fixe écrite dans Debian
+-> plus simple, et pas de risque de conflit avec une adresse que la
+box distribuerait à un autre appareil.
+
+ip link show enx0050b6cd50ce
+    -> affiche l'adresse MAC de l'adaptateur Ethernet du dock (après
+       "link/ether") : 00:50:b6:cd:50:ce
+       (le nom "enx..." de l'interface est d'ailleurs construit à
+       partir de cette MAC).
+
+Interface web de la Livebox (http://192.168.1.1), menu Réseau / DHCP :
+    -> bail statique ajouté : MAC 00:50:b6:cd:50:ce -> 192.168.1.28
+
+Côté Debian, rien à changer : /etc/network/interfaces garde
+"iface enx0050b6cd50ce inet dhcp" (gestionnaire ifupdown) ; c'est la
+box qui renverra toujours la même adresse.
+Contrôle : 192.168.1.28/24, passerelle 192.168.1.1. OK.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 5 - Installation de Docker (dépôt officiel)
+--------------------------------------------------------------------------
+Principe : image = modèle d'application téléchargé ; conteneur = copie
+de l'image en fonctionnement, isolée du système. docker compose décrit
+tous les conteneurs dans un fichier texte (compose.yaml).
+Choix du dépôt officiel Docker plutôt que le paquet Debian "docker.io" :
+version à jour et plugin "docker compose" (v2).
+
+sudo apt install -y ca-certificates curl
+    -> curl (téléchargement) + certificats racine (vérification HTTPS).
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+    -> crée le dossier des clés de dépôts, télécharge la clé de
+       signature de Docker et la rend lisible par apt. Grâce à elle,
+       apt refuse tout paquet qui ne serait pas signé par Docker.
+
+sudo nano /etc/apt/sources.list.d/docker.sources
+    -> déclare le dépôt (format "deb822", un champ par ligne) :
+         Types: deb
+         URIs: https://download.docker.com/linux/debian
+         Suites: trixie
+         Components: stable
+         Architectures: amd64
+         Signed-By: /etc/apt/keyrings/docker.asc
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    -> moteur Docker (service), commande docker, containerd (lance
+       réellement les conteneurs), buildx (construction d'images),
+       plugin compose.
+
+sudo docker run --rm hello-world
+    -> test : télécharge une image minuscule, la lance, supprime le
+       conteneur (--rm). Message "Hello from Docker!" = OK.
+
+sudo usermod -aG docker saaos
+    -> ajoute saaos au groupe docker (-a = ajouter sans retirer les
+       autres groupes) pour utiliser docker sans sudo.
+       SECURITE : appartenir au groupe docker = équivalent root
+       (Docker peut monter n'importe quel dossier). Acceptable car
+       utilisateur unique ; ne jamais l'accorder à un tiers.
+    -> déconnexion / reconnexion SSH : les groupes ne sont lus qu'à
+       l'ouverture de session.
+
+Vérifications (OK) :
+  - Docker 29.9.3, Docker Compose v5.7.0
+  - services docker et containerd : enabled (démarrent au boot), active
+  - stockage : overlayfs, dossier /var/lib/docker (SSD système ADATA)
+  - cgroup driver systemd ; journaux des conteneurs : json-file
+Observation : une session ouverte AVANT le usermod (ici celle de Claude
+Code) obtient "permission denied ... docker.sock". Normal : il faut une
+nouvelle session (ou "sg docker -c '...'" pour tester ponctuellement).
+Suite (2026-11-11) : session SSH rouverte par l'utilisateur -> "docker ps"
+fonctionne désormais sans sudo (groupe docker pris en compte). OK.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 6 - Organisation des dossiers
+--------------------------------------------------------------------------
+Principe : séparer 3 types de données.
+  - la "recette" (compose.yaml, docs)   -> ~/serveur-maison/ (dépôt GitHub)
+  - l'état des applis (config, bases)   -> /srv/appdata/<appli>/ (SSD
+    système, HORS du dépôt : contient mots de passe/clés, jamais publié)
+  - les gros fichiers                   -> /mnt/medias, /mnt/telechargements
+/srv = emplacement prévu par Linux pour les données "servies" par la machine.
+
+Problème des deux disques : impossible de faire un lien (hardlink) d'un
+disque à l'autre, donc garder un torrent sur le Samsung ET le média sur le
+Crucial doublerait la place occupée.
+Solution retenue (fonction native de qBittorrent) :
+  - téléchargement en cours -> /mnt/telechargements/incomplets (Samsung,
+    encaisse les écritures désordonnées)
+  - torrent terminé -> déplacé automatiquement vers /mnt/medias/<catégorie>
+    (Crucial), le partage (seed) continue depuis là. Une seule copie.
+  - non-médias terminés -> /mnt/telechargements/termines
+  - Jellyfin / Navidrome lisent /mnt/medias.
+
+mkdir -p /mnt/medias/{films,series,musique}
+mkdir -p /mnt/telechargements/{incomplets,termines,sauvegardes}
+    -> -p : crée les parents si besoin, pas d'erreur si déjà présent.
+       {a,b,c} : expansion d'accolades de bash (3 dossiers en 1 ligne).
+       Pas de sudo : disques donnés à saaos à l'étape 2.
+
+sudo mkdir -p /srv/appdata/{gluetun,qbittorrent,jellyfin,navidrome}
+sudo chown -R saaos:saaos /srv/appdata
+    -> /srv appartient à root, d'où sudo ; puis on donne le tout à saaos
+       (-R = récursif). Les conteneurs tourneront en UID 1000 (saaos) :
+       principe du moindre privilège.
+       Dossier du reverse proxy : créé à son étape.
+
+sudo apt install -y tree
+tree -L 1 /mnt/medias /mnt/telechargements /srv/appdata
+    -> affiche l'arborescence (1 niveau).
+
+Résultat : OK, aucune erreur.
+  - Tous les dossiers appartiennent à saaos:saaos.
+  - Droits 775 sous /mnt (créés par saaos, umask 002) et 755 sous
+    /srv/appdata (créés via sudo, umask 022 de root). Sans conséquence :
+    seul saaos écrit dedans.
+  - lost+found (root, 700) présent sur chaque disque : créé par ext4,
+    utilisé par fsck pour ranger les fragments récupérés après une coupure.
+    NE PAS SUPPRIMER.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 7 - Tunnel VPN (Gluetun + Proton VPN WireGuard)
+--------------------------------------------------------------------------
+Principes :
+  - WireGuard = protocole VPN à paire de clés. La clé PRIVEE (secret,
+    jamais sur GitHub ni dans la conversation) prouve l'abonnement.
+    Chez Proton, une même clé fonctionne sur tous les serveurs.
+  - Kill switch : qBittorrent n'aura AUCUN réseau propre ; il sera branché
+    dans le réseau du conteneur Gluetun, dont le pare-feu bloque tout sauf
+    le tunnel. VPN coupé = aucun chemin vers internet.
+  - Redirection de port NAT-PMP : Proton ouvre un port côté serveur VPN
+    (rien d'ouvert sur la Livebox), Gluetun le récupère.
+
+7.2 Génération de la configuration (account.protonvpn.com > Téléchargements
+> Configurations WireGuard) : nom "serveur-maison", plateforme GNU/Linux,
+NetShield "malwares", Moderate NAT désactivé, NAT-PMP (Port Forwarding)
+ACTIVE, VPN Accelerator activé, serveur suisse P2P.
+Seule la ligne "PrivateKey" est utile. Fichier .conf supprimé côté Windows.
+
+7.3 Fichier des secrets
+install -m 600 /dev/null ~/serveur-maison/.env
+    -> crée un fichier vide déjà en droits 600 (lecture/écriture pour
+       saaos seul), AVANT d'y écrire le secret.
+nano ~/serveur-maison/.env
+    -> une ligne : WIREGUARD_PRIVATE_KEY=<clé>  (sans espace ni guillemet)
+       docker compose lit automatiquement .env ; compose.yaml n'y fera
+       référence que par ${WIREGUARD_PRIVATE_KEY}.
+Vérification (sans afficher la clé) : saaos:saaos 600, 1 ligne, clé de
+44 caractères au format base64, pas d'espace/guillemet/retour Windows. OK.
+
+7.4 Fichier .gitignore
+nano ~/serveur-maison/.gitignore
+    -> contient ".env" : git ignorera ce fichier, le secret ne pourra pas
+       être publié sur GitHub par erreur.
+
+7.5 Fichier compose.yaml (service gluetun)
+nano ~/serveur-maison/compose.yaml
+    Points clés :
+      image qmcgaw/gluetun:v3        tag de version majeure (pas de rupture)
+      cap_add NET_ADMIN              seul droit réseau accordé (pas root total)
+      devices /dev/net/tun           interface tunnel du noyau
+      sysctls disable_ipv6=1         IPv6 supprimé dans le réseau de Gluetun
+                                     (en plus du blocage par son pare-feu :
+                                     défense en profondeur)
+      WIREGUARD_PRIVATE_KEY=${...}   valeur lue dans .env
+      SERVER_COUNTRIES=Switzerland
+      PORT_FORWARD_ONLY=on           uniquement serveurs P2P compatibles
+      VPN_PORT_FORWARDING=on         port NAT-PMP demandé et renouvelé
+      ports 192.168.1.28:8080:8080   interface web qBittorrent limitée au
+                                     réseau local
+      restart unless-stopped         redémarre après plantage / reboot
+    LECON : les ports publiés par Docker passent AVANT ufw (Docker écrit
+    ses propres règles). D'où l'adresse IP précisée devant le port.
+
+7.6 Validation et démarrage
+cd ~/serveur-maison
+docker compose config --quiet
+    -> valide la syntaxe sans rien afficher. ATTENTION : sans --quiet la
+       commande affiche la clé privée en clair.
+docker compose up -d gluetun
+    -> télécharge l'image, crée et démarre le conteneur en arrière-plan.
+docker logs -f gluetun
+    -> suit le journal en direct (Ctrl+C pour sortir, le conteneur
+       continue de tourner).
+
+Résultat : OK, aucune erreur.
+  - Conteneur gluetun : Up (healthy)
+  - Serveur WireGuard 62.169.136.3:51820
+  - IP publique vue d'internet : 62.169.136.54 (Suisse, Zurich)
+  - Port redirigé obtenu : 34830 (écrit dans /tmp/gluetun/forwarded_port ;
+    il peut changer à chaque reconnexion)
+  - IPv6 : disable_ipv6=1 et aucune adresse IPv6 dans le conteneur.
+  - Port 8080 publié sur 192.168.1.28 uniquement.
+Remarque : le message "Wireguard is a silent protocol..." n'est pas une
+erreur, juste un avertissement générique (WireGuard ne signale pas les
+échecs ; c'est l'obtention de l'IP publique qui prouve que ça marche).
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 8 - qBittorrent dans le réseau de Gluetun
+--------------------------------------------------------------------------
+Principes :
+  - network_mode: "service:gluetun" : qBittorrent n'a pas de carte réseau
+    propre, il partage celle de Gluetun (interface tun0 + pare-feu).
+    Son localhost (127.0.0.1) est le même que celui de Gluetun.
+  - Gluetun transmet le port NAT-PMP à l'API web de qBittorrent
+    (VPN_PORT_FORWARDING_UP_COMMAND + wget), ce qui nécessite l'option
+    "Bypass authentication for clients on localhost".
+  - VPN coupé : torrents bloqués à 0 ko/s, reprise automatique.
+    Conteneur Gluetun arrêté/recréé : qBittorrent perd le réseau jusqu'à
+    son propre redémarrage (gênant mais SANS fuite) -> toujours
+    "docker compose down" puis "docker compose up -d".
+  - 3 protections indépendantes : réseau partagé, pare-feu Gluetun,
+    qBittorrent lié à l'interface tun0.
+
+nano compose.yaml
+    -> ajout dans gluetun de VPN_PORT_FORWARDING_UP_COMMAND (envoie
+       {"listen_port":<port>} à http://127.0.0.1:8080/api/v2/app/setPreferences)
+    -> ajout du service qbittorrent : image lscr.io/linuxserver/qbittorrent,
+       network_mode service:gluetun, depends_on gluetun "service_healthy",
+       PUID/PGID 1000, WEBUI_PORT 8080, volumes /srv/appdata/qbittorrent
+       -> /config, /mnt/telechargements -> /telechargements,
+       /mnt/medias -> /medias.
+docker compose config --quiet
+docker compose down
+docker compose up -d
+    -> down supprime les conteneurs (pas les données de /srv/appdata),
+       up recrée tout dans l'ordre (qBittorrent après Gluetun "healthy").
+docker logs qbittorrent
+    -> récupération du mot de passe temporaire de "admin".
+
+Réglages faits dans l'interface web (http://192.168.1.28:8080) :
+  Advanced   : Network interface = tun0, IP de liaison = toutes IPv4
+  Connection : UPnP/NAT-PMP du routeur DESACTIVE (ne jamais ouvrir de port
+               sur la Livebox)
+  Downloads  : enregistrement par défaut /telechargements/termines,
+               incomplets dans /telechargements/incomplets
+Vérifié dans /srv/appdata/qbittorrent/qBittorrent/qBittorrent.conf : OK.
+
+Test : IP publique vue DEPUIS le conteneur qbittorrent
+  docker exec qbittorrent curl -s https://ipinfo.io/json
+  -> 79.127.184.193, Zürich, CH : le trafic de qBittorrent sort par le VPN.
+  (Serveur différent de l'étape 7 : à chaque recréation, Gluetun choisit
+  un serveur suisse P2P au hasard. Normal.)
+
+BUG 1 : transmission du port en échec "ERROR 403: Forbidden"
+  Cause : les réglages de l'onglet Web UI (mot de passe personnel et
+  "Bypass authentication for clients on localhost") n'avaient pas encore
+  été enregistrés : absents du fichier de configuration. L'API refuse
+  donc la requête de Gluetun, non authentifiée.
+  Conséquence : port d'écoute de qBittorrent resté à 6881 au lieu du port
+  Proton (40126). Torrents fonctionnels mais moins bien connectés.
+  AUCUN impact sur la sécurité (pas de fuite).
+  Solution : enregistrer ces réglages puis down/up (voir suite).
+
+OBSERVATION : erreurs NAT-PMP périodiques
+  "read udp 10.2.0.2:...->10.2.0.1:5351: recvfrom: connection refused"
+  La passerelle NAT-PMP de Proton (10.2.0.1, port 5351) refuse
+  ponctuellement le renouvellement du bail (toutes les ~15 min parfois).
+  Gluetun réessaie toutes les 5 s et récupère le MEME port en moins d'une
+  minute. Comportement connu chez Proton, sans gravité. A surveiller : si
+  le port change souvent, la transmission automatique s'en charge.
+  (Le conseil "+pmp à la fin du nom d'utilisateur OpenVPN" ne concerne
+  pas WireGuard : à ignorer.)
+
+Correction BUG 1, 1er essai (14h00) : mot de passe personnel enregistré
+(clé Password_PBKDF2 présente = mot de passe stocké sous forme de hachage
+PBKDF2, jamais en clair). MAIS "Bypass authentication for clients on
+localhost" toujours absent (WebUI\LocalHostAuth=false manquant) ;
+test depuis Gluetun : wget http://127.0.0.1:8080/api/v2/app/version
+-> toujours 403. Case non cochée ou non enregistrée : à refaire.
+
+Correction BUG 1, 2e essai : case "Bypass authentication for clients on
+localhost" cochée et enregistrée -> WebUI\LocalHostAuth=false présent.
+"Bypass ... whitelisted IP subnets" laissé DECOCHE (sinon tout le réseau
+local accéderait sans mot de passe).
+Test API depuis Gluetun : HTTP 200, version qBittorrent v5.3.0. OK.
+
+cd ~/serveur-maison && docker compose down && docker compose up -d
+    -> redémarrage complet pour que Gluetun transmette le port.
+
+Résultat : BUG 1 RESOLU.
+  - Nouveau serveur : IP publique 212.104.214.155 (Zurich, CH)
+  - Port Proton : 56370 ; réponse de l'API qBittorrent : 200 (au lieu de 403)
+  - Port d'écoute de qBittorrent (lu via l'API) : 56370 = identique
+  - qBittorrent : interface tun0, UPnP désactivé
+  - IP vue depuis le conteneur qbittorrent : 212.104.214.155 (CH)
+LECON : toujours vérifier qu'un réglage est réellement ENREGISTRE (fichier
+de configuration ou API), pas seulement qu'il a été cliqué.
+
+
+INCIDENT (vers 14h10) : session SSH depuis le PC Windows coupée
+  Diagnostic fait sans droits root (journal système illisible sans sudo :
+  l'utilisateur n'est pas dans le groupe adm/systemd-journal).
+  - uptime / last -x : pas de redémarrage depuis 12h10 -> pas de plantage,
+    ni de mise en veille du serveur.
+  - /sys/class/net/enx0050b6cd50ce/carrier_changes = 2 (montée au
+    démarrage seulement) -> le câble Ethernet du dock n'a jamais décroché.
+  - ss -tnoi : les 2 connexions SSH venant de 192.168.1.15 (PC Windows)
+    sont encore ouvertes côté serveur. L'une a des données non acquittées
+    (Send-Q 112, 11 retransmissions, plus rien reçu depuis ~14h12) : le
+    serveur parle, Windows ne répond plus.
+  - ping 192.168.1.1 (Livebox) : OK. ping 192.168.1.15 : aucune réponse.
+  - Conteneurs gluetun (healthy) et qbittorrent : en marche, non affectés.
+  Conclusion : la coupure vient du côté Windows (veille, coupure réseau,
+  changement d'adresse IP, ou VPN activé sur Windows bloquant le réseau
+  local), PAS du serveur.
+  Les sessions fantômes (pts/0, pts/1) seront fermées automatiquement par
+  le noyau à l'expiration des retransmissions TCP.
+  Reprise de la session au clavier physique (tty1, 14h18).
+  Confirmation de l'utilisateur (14h27) : c'était bien le PC Windows dont
+  le réseau s'est arrêté brutalement. Serveur non concerné : diagnostic
+  confirmé. Gluetun (healthy) et qbittorrent tournaient toujours.
+
+  14h35 : Wi-Fi du PC Windows toujours instable -> travail poursuivi
+  directement au clavier du serveur (tty1). Les sessions SSH restantes
+  (pts/0, pts/3, pts/4 depuis 192.168.1.15) sont sans effet sur les
+  services. Conteneurs gluetun (healthy) et qbittorrent : toujours en marche.
+  Piste pour plus tard : relier le PC Windows en Ethernet à la Livebox
+  pour une administration SSH stable.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 9 - Test du kill switch (14h37-14h40)
+--------------------------------------------------------------------------
+But : prouver que qBittorrent ne peut JAMAIS sortir par la connexion Orange,
+même quand le VPN tombe. Tests exécutés par Claude (console unique tty1).
+NOTE PUBLICATION : ne jamais écrire l'IP publique Orange complète dans ce
+fichier (dépôt GitHub public) -> notée 83.115.x.x.
+
+Référence :
+  curl -s https://ipinfo.io/json                      (sur l'hôte)
+    -> 83.115.x.x, Orange (AS3215) = vraie connexion
+  docker exec qbittorrent curl -s https://ipinfo.io/json
+    -> 212.104.214.155, Zurich, Datacamp = VPN Proton
+  docker exec gluetun iptables -S
+    -> politiques par défaut INPUT/FORWARD/OUTPUT = DROP (tout interdit),
+       sorties autorisées uniquement : lo, connexions déjà établies,
+       réseau Docker 172.18.0.0/16, le serveur Proton (UDP 51820 sur eth0),
+       et tout ce qui passe par tun0.
+  docker exec gluetun ip6tables -S -> IPv6 : tout en DROP aussi.
+
+TEST 1 - panne du tunnel (simule un serveur Proton qui tombe)
+  docker exec gluetun ip link set tun0 down
+  Depuis qbittorrent :
+    a) curl https://ipinfo.io        -> échec (code 28 = délai dépassé)
+    b) curl https://1.1.1.1 (sans DNS) -> échec
+    c) curl --interface eth0 (contournement volontaire du VPN) -> échec
+       = le pare-feu de Gluetun bloque même un essai direct par eth0
+    d) curl -6 (IPv6)               -> échec
+  Réparation automatique : Gluetun détecte la panne, reconnecte un autre
+  serveur suisse (185.159.157.75) en ~32 s, obtient un nouveau port (54098)
+  et le transmet à qBittorrent (réponse API 200, listen_port=54098 vérifié).
+  RESULTAT : AUCUNE FUITE, reprise automatique.
+
+TEST 2 - arrêt complet du conteneur Gluetun
+  docker stop gluetun
+  qbittorrent reste "running" mais ne voit plus que l'interface lo
+  (/proc/net/dev) : plus aucune carte réseau.
+  curl https://1.1.1.1 -> échec (code 7 = connexion impossible).
+  RESULTAT : AUCUNE FUITE. Comme prévu à l'étape 8, il faut recréer :
+  cd ~/serveur-maison && docker compose down && docker compose up -d
+    -> nouveau serveur 79.127.184.164 (CH), port 41386, interface tun0.
+
+CONCLUSION : kill switch VALIDE. Exigence du projet respectée :
+  VPN down -> qBittorrent coupé d'internet -> reprise au retour du VPN.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 10 - Jellyfin et Navidrome (accès local)
+--------------------------------------------------------------------------
+Principes :
+  - Jellyfin = films/séries ; Navidrome = musique. HORS VPN (volontaire :
+    ils doivent être joignables depuis la maison puis depuis internet).
+  - Médias montés en LECTURE SEULE (:ro) : moindre privilège, un bug ou un
+    piratage ne peut rien effacer.
+  - user 1000:1000 : les applis tournent avec l'utilisateur saaos, pas root.
+  - Jellyfin : accès à la puce graphique Intel HD 5500 (i7-5600U) pour le
+    transcodage matériel : devices /dev/dri + group_add "992" (GID du
+    groupe render de l'hôte ; on met le NUMERO car le nom n'existe pas
+    forcément dans le conteneur).
+  - Ports liés à 192.168.1.28 uniquement (réseau local), comme qBittorrent.
+
+10.1 mkdir -p /srv/appdata/jellyfin/{config,cache}
+     -> {a,b} = expansion d'accolades : crée les 2 dossiers d'un coup.
+     -> les créer soi-même évite que Docker les crée en root.
+   BUG 2 : dossier créé sous /srv/appdata/Jellyfin (J majuscule) au lieu de
+     /srv/appdata/jellyfin. Linux DISTINGUE majuscules et minuscules :
+     ce sont 2 dossiers différents ; Docker aurait créé jellyfin/config en
+     root -> Jellyfin incapable d'écrire.
+     Correction (par Claude) :
+       mv /srv/appdata/Jellyfin/config /srv/appdata/Jellyfin/cache /srv/appdata/jellyfin/
+       rmdir /srv/appdata/Jellyfin    (rmdir ne supprime qu'un dossier VIDE)
+     LECON : vérifier avec ls après chaque création ; utiliser Tab pour
+     compléter les chemins existants.
+
+10.2 compose.yaml : ajout des services jellyfin et navidrome (édition faite
+     par Claude, pas de copier-coller possible depuis la console tty1).
+       jellyfin  : image jellyfin/jellyfin:latest, port 192.168.1.28:8096,
+                   /config, /cache, /mnt/medias -> /medias:ro
+       navidrome : image deluan/navidrome:latest, port 192.168.1.28:4533,
+                   /srv/appdata/navidrome -> /data,
+                   /mnt/medias/musique -> /music:ro,
+                   ND_SCANSCHEDULE=1h (scan de la musique toutes les heures)
+
+10.3 docker compose config --quiet   -> syntaxe OK
+     docker compose up -d            -> crée seulement les 2 nouveaux
+                                        conteneurs ; gluetun/qbittorrent
+                                        inchangés, non redémarrés.
+Vérifications :
+  - jellyfin (healthy) : http://192.168.1.28:8096/health -> 200
+  - navidrome          : http://192.168.1.28:4533/ping   -> 200
+  - touch dans /medias et /music -> "Read-only file system" : lecture
+    seule confirmée.
+  - Dans jellyfin : id -> groups=1000,992 ; /dev/dri/renderD128 présent ;
+    vainfo -> pilote Intel iHD, H.264 décodage (VLD) + encodage (EncSlice)
+    = transcodage matériel possible.
+  - Aucune erreur dans les journaux des deux conteneurs.
+
+OBSERVATION : lenteurs ponctuelles du tunnel VPN
+  Depuis qbittorrent, environ 1 requête sur 4 met ~5 s (au lieu de 0,2 s),
+  une a dépassé 10 s. Tunnel actif, IP toujours suisse (79.127.184.164),
+  gluetun healthy. Pas une fuite : un ralentissement. Cause probable :
+  serveur Proton chargé ou pertes de paquets. A surveiller ; si ça
+  persiste, essayer un autre serveur (Pays-Bas / Islande).
+
+10.4 Assistants de configuration (navigateur depuis le PC Windows)
+  Jellyfin  : compte admin créé, interface et métadonnées en français/FR,
+              bibliothèques Films -> /medias/films (movies),
+              Séries -> /medias/series (tvshows),
+              accès distant autorisé, UPnP désactivé.
+  Navidrome : compte admin "saaos" créé ("Creating initial user").
+  Vérifié dans les fichiers (et pas seulement à l'écran) :
+    /srv/appdata/jellyfin/config/config/system.xml
+      IsStartupWizardCompleted=true, UICulture=fr, MetadataCountryCode=FR
+    /srv/appdata/jellyfin/config/config/network.xml
+      EnableRemoteAccess=true, EnableUPnP=false, EnableIPv6=false
+    /srv/appdata/jellyfin/config/root/default/*/options.xml : chemins OK
+    docker logs navidrome : utilisateur initial créé.
+  Version Jellyfin : 12.4.0.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 11 - Accès depuis internet : réflexion et DECISION
+--------------------------------------------------------------------------
+Question de l'utilisateur : pourquoi ne pas tout faire passer par Tailscale,
+ça semble plus sûr ?
+Analyse :
+  - Oui, Tailscale seul = surface d'attaque quasi nulle : aucun port ouvert
+    sur la box, serveur invisible pour un inconnu ; protection par ce qu'on
+    POSSEDE (appareil inscrit) et non par ce qu'on SAIT (mot de passe).
+    "Ne pas exposer vaut mieux que bien exposer."
+  - MAIS Android n'autorise qu'UN SEUL VPN actif à la fois. L'utilisateur
+    utilise souvent Proton VPN sur son téléphone -> Tailscale seul
+    obligerait à basculer Proton/Tailscale à chaque écoute.
+  - Le reverse proxy public est un simple site web : accessible À TRAVERS
+    Proton VPN, sans conflit.
+DECISION : solution HYBRIDE
+  - Jellyfin + Navidrome : HTTPS public (Caddy + DuckDNS + Let's Encrypt)
+  - qBittorrent (interface) + SSH : réseau local + Tailscale UNIQUEMENT
+  - Défense en profondeur : seuls 80/443 ouverts ; HTTPS ; compte admin
+    Jellyfin limité au réseau local + compte non-admin pour l'extérieur ;
+    fail2ban ; mises à jour régulières.
+  Idée avancée pour plus tard : nœud de sortie Tailscale à travers Gluetun.
+Méthode : à partir d'ici, Claude exécute les commandes et éditions en les
+expliquant (console tty1 sans copier-coller). L'utilisateur garde : sudo,
+interface Livebox/applis, et la saisie des secrets.
+
+11.0 Principes (trajet d'une requête depuis la 4G)
+  1. DNS : DuckDNS traduit xxx.duckdns.org -> IP publique de la Livebox.
+     L'IP publique Orange peut changer -> DNS DYNAMIQUE : un conteneur
+     prévient DuckDNS toutes les 5 min (preuve d'identité = token).
+  2. NAT : toute la maison partage UNE IP publique ; la box jette ce qui
+     arrive de l'extérieur, sauf règle de REDIRECTION DE PORT explicite.
+     On n'ouvre que 80 et 443 (jamais 8096, 4533, 8080, 22).
+  3. Reverse proxy (Caddy) : un seul portier sur 443, qui aiguille selon
+     le nom demandé (jellyfin:8096 / navidrome:4533).
+  4. HTTPS : certificat Let's Encrypt (gratuit, 90 jours, renouvelé par
+     Caddy). Preuve de contrôle du domaine = challenge HTTP-01 sur le
+     port 80 -> c'est pour ça que 80 est ouvert aussi.
+
+11.2 .env (secret, non publié, droits 600) : ajout par Claude de 3 lignes
+     VIDES à compléter par l'utilisateur dans nano :
+       DUCKDNS_TOKEN=   JELLYFIN_SUB=   NAVIDROME_SUB=
+     (sous-domaines sans ".duckdns.org" ; gardés hors de compose.yaml pour
+     ne pas afficher l'adresse du serveur sur GitHub)
+     Claude ne lit JAMAIS .env : contrôle via "cut -d= -f1 .env" (affiche
+     les noms des variables, pas les valeurs).
+
+11.3/11.4 Fichiers (écrits par Claude)
+  mkdir -p /srv/appdata/caddy/{data,config} /srv/appdata/duckdns
+    -> /srv/appdata/caddy/data contiendra les CERTIFICATS (à sauvegarder :
+       Let's Encrypt limite le nombre de demandes).
+  ~/serveur-maison/Caddyfile :
+    - options globales : protocols h1 h2 (pas d'HTTP/3 = pas d'UDP 443)
+    - {$JELLYFIN_SUB}.duckdns.org  -> reverse_proxy jellyfin:8096
+    - {$NAVIDROME_SUB}.duckdns.org -> reverse_proxy navidrome:4533
+    - en-tête Strict-Transport-Security (HSTS) : le navigateur refusera
+      ensuite tout accès non chiffré à ces noms pendant 1 an.
+    Les noms "jellyfin" et "navidrome" sont résolus par le DNS interne de
+    Docker (même réseau serveur-maison_default).
+  compose.yaml :
+    - duckdns : lscr.io/linuxserver/duckdns, SUBDOMAINS/TOKEN lus dans .env,
+      UPDATE_IP=ipv4.
+    - caddy : image caddy:2, user 1000:1000 (pas root : Docker autorise
+      les ports < 1024 dans les conteneurs), ports 192.168.1.28:80 et :443,
+      Caddyfile monté en lecture seule.
+  docker compose config --quiet -> OK
+  docker run --rm -e JELLYFIN_SUB=test1 -e NAVIDROME_SUB=test2 ... caddy
+  validate -> "Valid configuration" (conteneur jetable, --rm).
+  Conteneurs PAS encore démarrés (attente du .env et de la box).
+
+11.4 bis Jellyfin derrière un proxy (SECURITE)
+  Problème : derrière Caddy, tout arrive depuis 172.18.0.x ; or Jellyfin
+  considère par défaut toutes les IP privées comme "locales" -> un visiteur
+  d'internet passerait pour local (contournerait la restriction "admin
+  local seulement").
+  docker compose stop jellyfin       (sinon il peut écraser le fichier)
+  cp network.xml network.xml.bak-avant-proxy   (copie de secours)
+  sed -i ... /srv/appdata/jellyfin/config/config/network.xml
+    LocalNetworkSubnets = 192.168.1.0/24   (seul le réseau maison est local)
+    KnownProxies        = 172.18.0.0/16    (réseau Docker = proxy de
+                          confiance -> Jellyfin lit X-Forwarded-For, la
+                          vraie IP du visiteur écrite par Caddy)
+  docker compose start jellyfin -> health 200, réglages conservés.
+
+  15h15 - Réglage TEMPORAIRE pour travailler au clavier du serveur :
+  l'écran de la console s'éteignait après 60 s (consoleblank=60, réglé à
+  l'étape de mise en service dans /etc/default/grub). La session, elle,
+  n'était jamais fermée (TMOUT non défini).
+    setterm --term linux --blank 0 > /dev/tty1
+    -> envoie à la console tty1 la séquence "ne plus éteindre l'écran".
+       Pas besoin de sudo : saaos possède /dev/tty1 tant qu'il y est
+       connecté. Effet limité à tty1, jusqu'au prochain redémarrage
+       (le paramètre noyau consoleblank=60 reste inchangé).
+    Retour à la normale sans redémarrer : setterm --blank 1 (en minutes,
+    à taper sur tty1).
+
+11.1 / 11.5 Livebox (fait par l'utilisateur, interface web 192.168.1.1)
+  - Bail DHCP statique : x1x (MAC 00:50:b6:cd:50:ce) -> 192.168.1.28
+  - NAT/PAT : 2 règles via les modèles "HTTP" (80->80 TCP) et "HTTPS"
+    (443->443 TCP) vers 192.168.1.28. Modèles SSH/Telnet/FTP volontairement
+    écartés (SSH = admin du serveur ; Telnet/FTP = protocoles NON chiffrés).
+    Culture : ports "bien connus" HTTP 80, HTTPS 443, SSH 22, Telnet 23,
+    FTP 20/21.
+11.2 .env rempli par l'utilisateur (token + 2 sous-domaines).
+  Contrôle par Claude SANS afficher les valeurs (awk : longueur + format) :
+  token = 36 caractères au format UUID ; sous-domaines [a-z0-9-] ; clé
+  WireGuard intacte.
+
+11.6 Démarrage et tests
+  docker compose up -d duckdns
+    -> "DuckDNS request ... successful. IP(s) unchanged" : token valide.
+    -> les 2 sous-domaines résolvent bien vers l'IP de la box (83.115.x.x).
+  docker compose up -d caddy
+    -> challenge http-01 : Let's Encrypt vérifie depuis 6 IP dans le monde
+       (vérification multi-points, anti-tromperie), puis
+       "certificate obtained successfully" x2 en moins de 10 s.
+       = preuve que la redirection du port 80 fonctionne.
+  Test "visiteur extérieur" : curl lancé DANS le conteneur qbittorrent,
+  qui sort par Proton (Suisse) = vu de la box comme un inconnu d'internet.
+    - https Jellyfin -> 200, certificat vérifié ; https Navidrome -> 200
+    - http -> 308 (redirection permanente vers https)
+    - en-têtes : strict-transport-security présent, "via: 1.1 Caddy"
+    - IP publique ports 8096, 4533, 8080, 22 -> 000 = FERMES. OK.
+    - Depuis la maison, via le nom de domaine -> 200 : la Livebox gère le
+      "NAT loopback" (une requête interne vers l'IP publique revient à
+      l'intérieur).
+  Test IP réelle (sécurité KnownProxies) :
+    fausse connexion "pirate-test" depuis le VPN -> HTTP 401, et Jellyfin
+    journalise "denied (IP: 79.127.184.193)" = la VRAIE IP du visiteur,
+    pas celle de Caddy. La distinction local/distant est fiable.
+
+OBSERVATION : panne réelle du tunnel VPN à 15h12
+  Gluetun : "restarting VPN because it failed to pass the healthcheck" ->
+  reconnexion à un autre serveur de Zurich en 5 s, nouveau port 36698
+  transmis à qBittorrent. Le scénario du TEST 1 (étape 9) s'est produit en
+  vrai et s'est réglé seul. Avec les lenteurs ponctuelles déjà notées, les
+  serveurs suisses semblent instables aujourd'hui. A surveiller.
+
+11.7 Comptes (créés par l'utilisateur, navigateur)
+  Jellyfin  : saaos = admin, accès distant DESACTIVE (maison seulement)
+              + compte non-admin pour l'usage quotidien, accès distant OK
+  Navidrome : saaos = admin + compte non-admin pour les applis
+  Vérifié par Claude dans les bases SQLite (copies dans le dossier
+  temporaire, supprimées ensuite car elles contiennent les empreintes des
+  mots de passe) : table Permissions de Jellyfin (Kind 0 = admin,
+  Kind 4 = accès distant), table user de Navidrome (is_admin). Conforme.
+  Intérêt : un mot de passe du compte quotidien volé ne donne PAS le
+  contrôle du serveur.
+
+11.8 fail2ban (bannissement automatique des robots)
+  Principe : fail2ban lit un journal, repère les échecs de connexion et,
+  au-delà d'un seuil, ajoute une règle de pare-feu bloquant l'IP fautive.
+  Journal choisi : celui de CADDY (voit tout le trafic extérieur, la vraie
+  IP, et les 401 de Jellyfin ET de Navidrome = un seul journal pour deux).
+
+  A. Journal d'accès de Caddy (par Claude)
+    mkdir -p /srv/appdata/caddy/logs
+    Caddyfile : snippet "(journal)" (bloc réutilisable via "import") ->
+      log JSON dans /var/log/caddy/access.log, rotation 20 Mo x 5 fichiers.
+    compose.yaml : volume /srv/appdata/caddy/logs:/var/log/caddy
+    docker compose up -d caddy -> recréé ; certificats RÉUTILISÉS (0 nouvelle
+      demande : ils sont dans /srv/appdata/caddy/data).
+    Test : faux logins depuis le VPN -> 2 lignes "status":401 avec
+      client_ip = vraie IP du VPN (Jellyfin /Users/AuthenticateByName,
+      Navidrome /auth/login).
+  B. Règles (par Claude, versionnées dans ~/serveur-maison/fail2ban/)
+    filter.d/caddy-auth.conf : failregex sur client_ip + uri de login +
+      status 401 ; datepattern "ts":{EPOCH}.
+    jail.d/caddy-auth.local :
+      [DEFAULT] ignoreip = 127.0.0.1/8 192.168.1.0/24 172.16.0.0/12
+        100.64.0.0/10 (machine, maison, Docker, Tailscale) - pour toutes
+        les prisons, y compris "sshd" activée par Debian.
+      backend = auto (Debian 13 lit par défaut journald ; ici un fichier)
+      maxretry 5 / findtime 10m / bantime 1h, récidive doublée (max 1 sem.)
+      banaction = iptables-multiport[chain="DOCKER-USER"] : le trafic vers
+        les conteneurs traverse la chaîne FORWARD, pas INPUT ; DOCKER-USER
+        est la chaîne prévue par Docker pour nos règles. Sinon le
+        bannissement serait sans effet (même leçon que l'étape 7).
+    Limite connue : l'API Subsonic de Navidrome (/rest/, utilisée par les
+      applis mobiles) répond 200 même en cas d'échec -> non couverte.
+
+  OBSERVATION : 2e coupure du tunnel VPN à 15h28 (échecs TLS au contrôle
+  de santé), reprise seule en ~10 s (62.169.136.54, Zurich).
+
+  C. Installation (par l'utilisateur, sudo)
+    sudo apt install fail2ban
+    sudo cp ~/serveur-maison/fail2ban/filter.d/caddy-auth.conf /etc/fail2ban/filter.d/
+    sudo cp ~/serveur-maison/fail2ban/jail.d/caddy-auth.local /etc/fail2ban/jail.d/
+      -> COPIE et non lien : fail2ban tourne en root ; une config modifiable
+         par l'utilisateur serait une porte vers root.
+    sudo systemctl restart fail2ban
+  Vérifications (Claude) :
+    fail2ban-regex access.log caddy-auth.conf -> 2 lignes trouvées sur 197
+      (les 2 faux logins), 195 visites normales ignorées. Filtre OK.
+
+  BUG 3 : bannissement SANS EFFET
+    Test : 6 faux logins depuis le VPN -> le site restait accessible (200).
+    Diagnostic :
+      - journal de fail2ban illisible (root:adm) ->
+        sudo usermod -aG adm saaos   (lecture des journaux système ;
+        -a OBLIGATOIRE : sans lui, -G REMPLACE tous les groupes -> perte de
+        sudo et docker). Utilisé sans reconnexion via : sg adm -c "..."
+      - /var/log/fail2ban.log : "Ban 62.169.136.54" à 15h46:00... mais des
+        requêtes de cette IP arrivent encore à Caddy après.
+      - Règles du pare-feu (par l'utilisateur) :
+          sudo sh -c 'iptables-save; echo =====; nft list ruleset' > ~/serveur-maison/diag-pare-feu.txt
+          (petite faute de frappe : virgule au lieu de point-virgule ->
+          iptables-save en erreur, mais nft list ruleset suffisait ; la
+          redirection ">" est faite par le shell de l'utilisateur, donc le
+          fichier lui appartient). Fichier supprimé après lecture.
+        -> la chaîne DOCKER-USER est VIDE ; fail2ban s'est branché sur
+           INPUT (compteur : 0 paquet), alors que le trafic vers Caddy
+           passe par FORWARD -> DOCKER-USER -> DOCKER (compteur 443 : 47).
+    Cause : "banaction = iptables-multiport[chain=DOCKER-USER]" : la prison
+      transmet son propre paramètre "chain" (défaut INPUT) qui ÉCRASE celui
+      donné entre crochets. Erreur de configuration de Claude.
+    Correction : banaction = iptables-multiport + "chain = DOCKER-USER"
+      comme réglage de la prison.
+    LECON : tester l'EFFET réel d'une sécurité, pas sa présence. Le journal
+      disait "Ban" alors que rien n'était bloqué. Les compteurs de paquets
+      (nft list ruleset) montrent par où passe vraiment le trafic.
+    Application (utilisateur) :
+      sudo cp ~/serveur-maison/fail2ban/jail.d/caddy-auth.local /etc/fail2ban/jail.d/
+      sudo systemctl restart fail2ban
+        -> à l'arrêt, fail2ban retire ses règles (dont celle mal placée) ;
+           au démarrage : "Restore Ban 62.169.136.54" (bannissements en
+           cours conservés dans sa base de données).
+    Vérification de l'EFFET (Claude) :
+      - depuis le VPN (IP bannie) : connexion impossible (curl 000)
+      - depuis la maison : 200 (ignoreip OK)
+      - journal Caddy : 0 requête de l'IP bannie après 15h53:21
+    BUG 3 RESOLU. fail2ban opérationnel.
+
+  Commandes de pilotage de fail2ban (utilisateur) :
+    sudo fail2ban-client status caddy-auth
+      -> état de la prison : échecs en cours, IP bannies
+    sudo fail2ban-client set caddy-auth unbanip 62.169.136.54
+      -> débannit immédiatement l'IP de test (sortie Proton partagée)
+    Confirmé dans /var/log/fail2ban.log : "Unban 62.169.136.54" à 15h58.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 12 - Elargissement des serveurs VPN + bug 4
+--------------------------------------------------------------------------
+Constat : tunnel suisse tombé 2 fois en 20 min (15h12, 15h28) + lenteurs.
+Décision de l'utilisateur : élargir tout de suite (Claude conseillait
+d'observer quelques heures d'abord).
+  compose.yaml : SERVER_COUNTRIES=Switzerland,Netherlands
+    (Gluetun tire au sort parmi les serveurs P2P des 2 pays)
+  docker compose up -d --force-recreate gluetun qbittorrent
+    -> TOUJOURS recréer les 2 ensemble : qbittorrent partage le réseau de
+       gluetun ; gluetun recréé seul = qbittorrent sans réseau (étape 8).
+       Jellyfin, Navidrome, Caddy, DuckDNS non touchés.
+
+Essai 1 : Amsterdam (205.147.16.226) - tunnel OK MAIS
+  "ERROR [vpn] starting port forwarding service: port forwarding for the
+  first time: ... 10.2.0.1:5351: recvfrom: connection refused"
+  La passerelle NAT-PMP de Proton refuse la 1re demande et Gluetun NE
+  RÉESSAIE PAS : tunnel fonctionnel (aucune fuite), mais pas de port
+  redirigé -> qBittorrent injoignable par les autres pairs (plus lent).
+  Solution immédiate : recréer gluetun + qbittorrent (nouveau tirage).
+
+Essai 2 : Zurich (212.104.214.30), port 48800 obtenu, MAIS
+  - "dependency gluetun failed to start" : gluetun brièvement "unhealthy"
+    au démarrage -> Docker n'a PAS lancé qbittorrent (resté "Created").
+    = la protection depends_on/service_healthy a fait son travail.
+    docker compose up -d qbittorrent  -> démarrage manuel une fois sain.
+  BUG 4 : port non transmis. Gluetun avait tenté d'envoyer 48800 pendant
+    que qBittorrent était arrêté ("Connection refused"), puis abandonné
+    (wget : 20 essais par défaut). qBittorrent restait sur l'ancien port
+    36698.
+    Correction immédiate (Claude) : même requête que Gluetun, à la main :
+      docker exec gluetun sh -c 'P=$(cat /tmp/gluetun/forwarded_port); wget -qO- --post-data "json={\"listen_port\":$P}" http://127.0.0.1:8080/api/v2/app/setPreferences'
+      (/tmp/gluetun/forwarded_port = fichier où Gluetun écrit le port)
+    Correction durable : dans VPN_PORT_FORWARDING_UP_COMMAND, wget avec
+      --tries=0 (essais illimités) --waitretry=10 (attente jusqu'à 10 s
+      entre essais). Vérifié : wget de Gluetun = GNU Wget 1.25.0.
+    Essai 3 (après correction) : Zurich 212.104.214.30, port 48800,
+      transmis (réponse 200), Gluetun = qBittorrent = 48800. RESOLU.
+
+FAIBLESSE RESTANTE : si la 1re demande NAT-PMP échoue (essai 1), Gluetun
+  n'insiste pas. A traiter plus tard : petit "chien de garde" (script +
+  minuterie systemd) qui compare le port de Gluetun et celui de qBittorrent
+  et répare automatiquement.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 13 - Tailscale (accès admin à distance, sans exposer)
+--------------------------------------------------------------------------
+Principes :
+  - Tailscale = VPN "maillé" (mesh) basé sur WireGuard : chaque appareil
+    inscrit (le "tailnet") parle DIRECTEMENT aux autres, chiffré de bout
+    en bout. Le serveur de coordination de Tailscale ne fait que
+    distribuer les clés publiques et les adresses ; s'il n'y a pas de
+    chemin direct, un relais (DERP) transporte des paquets restant chiffrés.
+  - Traversée de NAT : aucun port à ouvrir sur la Livebox.
+  - Adresses 100.x.y.z (plage 100.64.0.0/10 dite "CGNAT", réservée, qui ne
+    se mélange pas avec 192.168.x.x) ; MagicDNS donne un nom à chaque appareil.
+  - Installé sur l'HÔTE (pas en conteneur) : il doit donner accès à SSH
+    et à tout le serveur.
+  - Route "sous-réseau" 192.168.1.28/32 annoncée par le serveur : les
+    appareils du tailnet joignent 192.168.1.28 MÊME HORS DE LA MAISON ->
+    http://192.168.1.28:8080 (qBittorrent) marche partout, sans changer
+    compose.yaml (le port reste lié à 192.168.1.28, jamais exposé à
+    internet). /32 = UNE seule adresse, pas tout le réseau maison.
+    (Alternative écartée : publier le port sur l'IP 100.x : au démarrage,
+    Docker peut se lancer avant Tailscale -> l'IP n'existe pas encore ->
+    le conteneur refuse de démarrer.)
+
+13.1 Dépôt de paquets (préparé par Claude, sans sudo)
+  Dossier ~/serveur-maison/tailscale/ :
+    curl -fsSO https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg
+      -> renommé tailscale-archive-keyring.gpg (clé publique qui signe les
+         paquets : apt refusera tout paquet non signé par elle)
+    curl -fsSO https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list
+      -> renommé tailscale.list : "deb [signed-by=...] https://pkgs.
+         tailscale.com/stable/debian trixie main" (adresse du dépôt + clé
+         autorisée À CE DÉPÔT SEULEMENT)
+  Vérification de l'empreinte (gpg absent -> calcul en Python : SHA-1 du
+  paquet de clé OpenPGP) :
+    2596 A99E AAB3 3821 893C 0A79 458C A832 957F 5868
+    "Tailscale Inc. (Package repository signing key)" = clé officielle.
+  ip_forward = 1 déjà (activé par Docker) : nécessaire pour les routes.
+
+13.2 Installation (utilisateur, sudo)
+  sudo cp ~/serveur-maison/tailscale/tailscale-archive-keyring.gpg /usr/share/keyrings/
+  sudo cp ~/serveur-maison/tailscale/tailscale.list /etc/apt/sources.list.d/
+  sudo apt update && sudo apt install tailscale
+    (&& = la 2e commande ne s'exécute que si la 1re a réussi)
+  sudo tailscale up --qr --advertise-routes=192.168.1.28/32
+    (--qr : lien de connexion affiché en QR code, scanné au téléphone)
+  Vérifié (Claude, sans sudo) :
+    tailscale 1.104.6 ; service tailscaled actif et activé au démarrage
+    serveur "tx1c3" = 100.117.242.40 (tx1c3.<tailnet>.ts.net), MagicDNS actif
+    Le tailnet existait déjà : PC Windows, iPhone 11, et un ancien
+    "thinkpad" (Linux, hors ligne depuis 5 jours).
+    Route 192.168.1.28/32 annoncée mais PAS ENCORE APPROUVÉE.
+    Expiration de la clé du serveur : 2027-05-10 (180 jours) -> à désactiver.
+  NOTE : le téléphone est un iPhone. iOS, comme Android, n'autorise qu'UN
+    seul VPN actif à la fois -> la décision "hybride" (étape 11) reste
+    valable.
+
+13.3 Console d'administration Tailscale (utilisateur, login.tailscale.com)
+  - Route 192.168.1.28/32 APPROUVÉE (sécurité Tailscale : un appareil ne
+    peut pas détourner le trafic des autres sans accord de l'admin).
+  - "Disable key expiry" sur tx1c3 : un serveur 24h/24 ne doit pas se
+    déconnecter seul tous les 180 jours. (On garde l'expiration sur le
+    téléphone/PC : appareils qu'on peut perdre.)
+  - Ancien appareil "thinkpad" (ancienne installation) SUPPRIMÉ : pas
+    d'appareil fantôme dans un réseau de confiance.
+  Vérifié : tailscale status --json -> PrimaryRoutes ['192.168.1.28/32'],
+    pas de KeyExpiry.
+
+13.4 Jellyfin : Tailscale considéré comme "local" (admin utilisable)
+  docker compose stop jellyfin ; copie network.xml.bak-avant-tailscale
+  LocalNetworkSubnets += 100.64.0.0/10 ; docker compose start jellyfin
+  Raisonnement sécurité :
+    - 100.64.0.0/10 ne circule pas sur internet : aucun vrai visiteur
+      extérieur n'a une telle IP.
+    - Mensonge via en-tête X-Forwarded-For : Caddy IGNORE cet en-tête
+      venant d'un client inconnu et le remplace par l'IP réelle.
+  Test d'usurpation : depuis le VPN, faux login avec
+    "X-Forwarded-For: 100.100.100.100" -> 401, et Jellyfin journalise
+    "IP: 212.104.214.30" (vraie IP). Usurpation impossible. OK.
+
+  Question de l'utilisateur : "pourquoi 192.168.1.28, l'adresse de mon PC ?"
+    -> 192.168.1.28 = le SERVEUR (ThinkPad X1 Carbon, carte Ethernet du
+       dock). Le PC Windows = 192.168.1.15 (source des sessions SSH).
+       Tailscale : serveur tx1c3 = 100.117.242.40 ; PC = 100.107.42.25 ;
+       iPhone = 100.106.70.1. Une IP appartient à une CARTE RÉSEAU.
+    Rappel : le port 8080 (qBittorrent) n'écoute que sur 192.168.1.28,
+    pas sur l'IP Tailscale -> utiliser 192.168.1.28 via la route. SSH, lui,
+    répond aussi sur tx1c3 / 100.117.242.40.
+
+BUG 5 : admin Jellyfin refusé via Tailscale (iPhone en 4G)
+  Journal Jellyfin : "Authentication request for saaos forbidden: remote
+  access disabled and user not in local network (IP: 172.18.0.1)"
+  Cause : pour une route qui vise l'adresse du serveur LUI-MÊME, tailscaled
+    sert d'intermédiaire : il reçoit la connexion de l'iPhone puis en
+    rouvre une depuis le serveur vers 192.168.1.28:8096 -> Jellyfin la voit
+    venir de la passerelle du réseau Docker, 172.18.0.1 (l'hôte), et non
+    de 100.106.70.1. Erreur de prévision de Claude. Le compte non-admin
+    passait (accès distant autorisé), ce qui confirme.
+  Correction : LocalNetworkSubnets += 172.18.0.1/32 (UNE adresse)
+    (stop jellyfin -> sed network.xml -> start)
+  Sûreté : 172.18.0.1 = uniquement des programmes de l'hôte (tailscaled,
+    console). Les visiteurs d'internet passent par Caddy (172.18.0.6) qui
+    transmet leur vraie IP. Adresses du réseau Docker relevées :
+    gluetun .2, jellyfin .3, navidrome .4, duckdns .5, caddy .6.
+  Test : faux login depuis le VPN avec "X-Forwarded-For: 172.18.0.1" ->
+    401, IP journalisée 212.104.214.30 (vraie). OK.
+    (1er essai -> 503 : Jellyfin pas encore prêt juste après redémarrage.)
+  A AMÉLIORER plus tard : KnownProxies = 172.18.0.0/16 est large (inclut
+    gluetun/qbittorrent) ; idéal = IP fixe pour Caddy et KnownProxies
+    limité à elle.
+
+13.5 Tests finaux depuis l'iPhone en 4G (utilisateur), recoupés par Claude
+  dans les journaux :
+  A. Tailscale ON, http://192.168.1.28:8080 -> qBittorrent accessible. OK
+  B. Tailscale ON, http://192.168.1.28:8096 -> admin saaos ACCEPTÉ
+     (16:29:58 "saaos has succeeded"). OK
+  C. Tailscale OFF + Proton VPN ON, https://<jellyfin>.duckdns.org :
+     admin REFUSÉ (16:31:57 "forbidden ... IP: 146.70.194.93" = IP Proton
+     de l'iPhone, vue à travers Caddy) ; compte non-admin ACCEPTÉ
+     (16:32:09). OK
+  Note : une tentative admin depuis internet compte comme un échec pour
+  fail2ban -> 5 essais = IP bannie 1 h (débannir si besoin).
+
+ETAT DU PROJET A 16h35 :
+  Seedbox   : qBittorrent derrière Gluetun (Proton WireGuard, CH/NL),
+              kill switch testé, port forwarding automatique.
+  Médias    : Jellyfin + Navidrome, HTTPS public via Caddy + DuckDNS +
+              Let's Encrypt, admin réservé maison/Tailscale, fail2ban.
+  Admin     : qBittorrent + SSH + admin Jellyfin via réseau local ou Tailscale.
+  Reste à faire (idées) : chien de garde du port VPN, sauvegardes de
+  /srv/appdata, mises à jour, IP fixe pour Caddy (KnownProxies), test des
+  applis Navidrome, dépôt GitHub.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 14 - Sauvegardes (restic + minuterie systemd)
+--------------------------------------------------------------------------
+Principes :
+  - Une sauvegarde n'est PAS une copie miroir/RAID : un miroir recopie aussi
+    les erreurs et suppressions. Il faut des VERSIONS (retour à hier,
+    la semaine dernière...).
+  - Règle 3-2-1 : 3 copies, 2 supports différents, 1 hors du domicile.
+    Ici : SSD système -> disque Samsung = 2 copies, 2 supports. Le "1 hors
+    site" (incendie, vol, surtension) viendra plus tard.
+  - Une sauvegarde jamais restaurée n'est qu'un espoir : on TESTE la
+    restauration.
+  - Cohérence : une base SQLite copiée en pleine écriture peut être
+    corrompue -> arrêt de jellyfin/navidrome/qbittorrent ~1 min à 04h30.
+Inventaire (16h35) : /srv/appdata ~22 Mo (gluetun 7 Mo, qbittorrent 8 Mo,
+  navidrome 5 Mo, jellyfin 1 Mo, caddy 0,8 Mo) + ~/serveur-maison 120 Ko.
+  Tous lisibles par saaos -> pas besoin de root pour sauvegarder.
+  Bases : navidrome.db, jellyfin.db.
+  Fichiers système modifiés au cours du projet (relevés dans ce journal) :
+  fstab, default/grub, network/interfaces, systemd/logind.conf.d,
+  fail2ban, apt/sources.list.d.
+Outil : restic (Debian 0.18.0) : dépôt CHIFFRÉ, DÉDUPLIQUÉ (un fichier
+  inchangé n'est stocké qu'une fois), "snapshots" datés, politique de
+  rétention. Le chiffrement permettra plus tard une copie hors site sur un
+  support qu'on ne contrôle pas.
+Fichiers écrits par Claude dans ~/serveur-maison/sauvegarde/ :
+  sauvegarde.sh (chmod 750) :
+    - set -euo pipefail : arrêt à la 1re erreur
+    - garde-fou "mountpoint -q /mnt/telechargements" : disque monté en
+      nofail -> s'il manque, le dossier vide existe SUR LE SSD SYSTÈME et
+      la sauvegarde le remplirait en silence.
+    - stop des 3 applis + "trap redemarrer EXIT" : redémarrage garanti
+      même en cas d'échec.
+    - restic backup (exclusion des caches), redémarrage, puis
+      forget --prune (7 quotidiennes / 4 hebdo / 6 mensuelles), check.
+  sauvegarde.service : oneshot, User=saaos, RequiresMountsFor=
+    /mnt/telechargements, After=docker.service, Nice=10, IO "idle".
+  sauvegarde.timer : OnCalendar 04:30, Persistent=true (rattrapage si le
+    serveur était éteint).
+  bash -n (contrôle de syntaxe) et systemd-analyze verify : OK.
+
+14.1 Installation et mot de passe (utilisateur)
+  sudo apt install restic                    -> restic 0.18.0
+  mkdir -p ~/.config/restic ; nano ~/.config/restic/mot-de-passe
+    -> phrase de passe longue sur 1 ligne, AUSSI notée hors du serveur
+       (sans elle, les sauvegardes sont illisibles pour toujours).
+       Hors du dossier du projet = jamais publiée sur GitHub.
+  Claude : chmod 700 ~/.config/restic ; chmod 600 mot-de-passe
+    contrôle sans lire : 1 ligne, 84 caractères, pas de ligne vide.
+
+14.2 Dépôt et première sauvegarde (Claude)
+  RESTIC_REPOSITORY=/mnt/telechargements/sauvegardes/restic
+  RESTIC_PASSWORD_FILE=~/.config/restic/mot-de-passe
+  restic init -> dépôt e957a416b5 créé (sous-dossiers config, data,
+    index, keys, locks, snapshots).
+  ~/serveur-maison/sauvegarde/sauvegarde.sh (lancé à la main, 6,5 s) :
+    arrêt des 3 applis -> snapshot 1e13fe06 : 82 fichiers, 17,3 Mo
+    (4,7 Mo stockés après compression) -> redémarrage -> rétention ->
+    "restic check : no errors were found". Code de sortie 0.
+    qBittorrent a gardé son port VPN (48800 = Gluetun).
+
+14.3 TEST DE RESTAURATION (Claude)
+  restic snapshots ; restic restore latest --target <dossier temporaire>
+  - SHA-256 identiques aux originaux : compose.yaml, Caddyfile, .env,
+    /etc/fstab, dossier des certificats Caddy.
+  - Bases restaurées : PRAGMA integrity_check = ok
+    (jellyfin.db 34 tables, navidrome.db 50 tables).
+  - Droits conservés (.env restauré en 600).
+  Dossier de restauration supprimé aussitôt (il contenait les secrets).
+  => Les sauvegardes sont RESTAURABLES : vérifié, pas supposé.
+
+14.4 Minuterie (utilisateur, sudo)
+  sudo cp ~/serveur-maison/sauvegarde/sauvegarde.service ~/serveur-maison/sauvegarde/sauvegarde.timer /etc/systemd/system/
+  sudo systemctl daemon-reload            -> systemd relit ses unités
+  sudo systemctl enable --now sauvegarde.timer
+    -> enable = actif à chaque démarrage ; --now = démarré tout de suite.
+       On active le .timer (le réveil), pas le .service (la tâche).
+  Vérifié : timer enabled + active ; prochaine exécution jeu. 12/11 04h30 ;
+    copies dans /etc/systemd/system identiques au projet.
+  Consulter : systemctl list-timers sauvegarde.timer
+
+14.5 Test sous systemd (utilisateur) - "tester l'effet réel"
+  Raison : le script avait marché lancé à la main ; sous systemd
+  l'environnement diffère (variables, chemins, droits) -> à vérifier avant
+  la 1re nuit.
+  sudo systemctl start sauvegarde.service   -> lance la tâche tout de suite
+  journalctl -u sauvegarde --no-pager       -> journal de la sauvegarde
+  Résultat : Result=success, code 0 ; snapshot cbdffd08 ; "no errors were
+    found" ; applis redémarrées ; port qBittorrent conservé (48800).
+  Observation : la rétention a GARDÉ les 2 snapshots du même jour, motif
+    "oldest daily/weekly/monthly snapshot" : tant que les cases (7 jours,
+    4 semaines, 6 mois) ne sont pas remplies, restic (>= 0.17) conserve
+    aussi le plus ancien. Normal ; il disparaîtra quand l'historique
+    sera assez long.
+  ETAPE 14 TERMINEE. Reste pour la règle 3-2-1 : une copie HORS SITE.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 15 - Protection "disque absent" (fail-safe)
+--------------------------------------------------------------------------
+Problème (repéré par Claude en écrivant le garde-fou des sauvegardes) :
+  les disques sont montés en "nofail". S'ils manquent, /mnt/telechargements
+  et /mnt/medias existent quand même (dossiers vides SUR LE SSD SYSTÈME).
+  - qBittorrent y téléchargerait -> SSD système de 128 Go rempli.
+  - Jellyfin y verrait une bibliothèque vide -> risque d'effacer la base
+    de la bibliothèque (affiches, progression) au scan suivant.
+  Et Docker n'attendait pas les disques au démarrage (aucun After= vers
+  mnt-*.mount) ; au dernier boot, montage à 4 s : ordre correct par chance.
+Constat avant correction : tout écrit bien sur sdb1 (téléchargements) et
+  sdc1 (médias). Aucun dégât.
+
+Couche 1 - "échouer de façon sûre" (compose.yaml, par Claude) :
+  Montage de SOUS-DOSSIERS qui n'existent QUE sur les disques, en syntaxe
+  longue avec bind: {create_host_path: false} (= ne pas créer la source si
+  elle manque, échouer).
+    qbittorrent : /mnt/telechargements/{incomplets,termines},
+                  /mnt/medias/{films,series,musique}
+    jellyfin    : /mnt/medias/{films,series} en read_only
+    navidrome   : /mnt/medias/musique -> /music en read_only
+  Chemins INTERNES inchangés -> aucun réglage d'appli à modifier.
+  Test préalable (projet Docker jetable, source inexistante) :
+    "bind source path does not exist" et 0 dossier créé. OK.
+  docker compose up -d qbittorrent jellyfin navidrome -> recréés.
+    (qbittorrent recréé seul : OK, c'est gluetun qui porte le réseau.)
+  Vérifié : montages attendus (ro pour jellyfin/navidrome), écriture de
+    qbittorrent sur /dev/sdb1, port VPN conservé (48800).
+
+Couche 2 - Docker attend les disques (drop-in systemd, par Claude) :
+  ~/serveur-maison/systemd/docker.service.d/attendre-disques.conf
+    After=mnt-medias.mount mnt-telechargements.mount   (ordre)
+    Wants=... (et non Requires : disque absent -> Docker démarre quand
+    même ; seuls les conteneurs concernés refusent de démarrer)
+  "Drop-in" : complément fusionné par systemd ; on ne modifie pas
+    docker.service d'origine (écrasé à chaque mise à jour du paquet).
+  Note : "systemd-analyze verify attendre-disques.conf" -> "Failed to
+    prepare filename ... Argument invalide". PAS une erreur de contenu :
+    verify n'accepte que des unités complètes (.service, .mount...), pas
+    un drop-in isolé. On vérifie donc APRÈS installation (ci-dessous).
+  Installation (par l'utilisateur) :
+    sudo mkdir -p /etc/systemd/system/docker.service.d
+      (nom imposé : <service>.d -> systemd sait à qui s'applique le fichier)
+    sudo cp ~/serveur-maison/systemd/docker.service.d/attendre-disques.conf \
+            /etc/systemd/system/docker.service.d/
+    sudo systemctl daemon-reload      (systemd relit ses fichiers)
+  Vérification (par Claude) :
+    systemctl show docker.service -p After -p Wants -p DropInPaths
+      DropInPaths = /etc/systemd/system/docker.service.d/attendre-disques.conf
+      After contient mnt-medias.mount et mnt-telechargements.mount
+      Wants contient mnt-medias.mount et mnt-telechargements.mount
+    systemctl cat docker.service -> le drop-in apparaît à la suite du
+      fichier d'origine (= fusion effectuée).
+  Docker NON redémarré : la règle ne joue qu'au prochain démarrage du
+    serveur (Docker tourne déjà avec les disques montés).
+  ETAPE 15 TERMINEE.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 16 - Surveillance automatique du port VPN
+--------------------------------------------------------------------------
+Analyse préalable des journaux de Gluetun (v3.41.3) :
+  - Tunnel DÉJÀ ouvert : Proton refuse parfois un renouvellement NAT-PMP
+    (10.2.0.1:5351 "connection refused", 7 fois entre 16h54 et 17h55).
+    Gluetun écrit "retrying in 5s" et récupère le MÊME port en 5-25 s.
+    -> pas besoin d'aide.
+  - Tunnel QUI S'OUVRE (cas Amsterdam 15h59) : message "[vpn] starting
+    port forwarding service ... for the first time", SANS "retrying".
+    -> Gluetun abandonne : qBittorrent reste sans port redirigé
+       (protégé, mais injoignable par les autres pairs). A CORRIGER.
+  (Correction de ma note de l'étape 13 : la faiblesse ne concerne QUE
+   l'ouverture du tunnel.)
+
+Problème de sécurité découvert en chemin :
+  Le serveur de contrôle de Gluetun (API, port 8000, SANS mot de passe)
+  écoutait sur toutes les interfaces ([::]:8000). Le pare-feu de Gluetun
+  accepte tout le réseau Docker (-A INPUT -d 172.18.0.0/16 -i eth0 -j
+  ACCEPT) -> test : depuis le conteneur caddy (exposé à internet),
+    docker exec caddy wget -qO- http://172.18.0.2:8000/v1/vpn/status
+    -> {"status":"running"}   (et PUT aurait pu ARRÊTER le VPN)
+  Pas de fuite possible (kill switch), mais une porte inutile.
+  Gluetun avertissait aussi : "route ... is unprotected by default".
+
+Partie 1 - fermer le serveur de contrôle (par Claude) :
+  compose.yaml, gluetun :
+    HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000   (localhost seulement)
+    ./gluetun/auth/config.toml:/gluetun/auth/config.toml:ro
+  gluetun/auth/config.toml : 1 rôle "surveillance-port", auth = "none"
+    (sûr car localhost), routes listées EXPLICITEMENT :
+    GET /v1/portforward, GET /v1/vpn/status, PUT /v1/vpn/status
+    -> continuera de marcher quand Gluetun bloquera par défaut (v4).
+  docker compose config --quiet ; docker compose up -d
+    -> gluetun + qbittorrent recréés (qbit vit dans le réseau de gluetun)
+  Vérifié : "read 1 roles from authentication file",
+    "http server listening on 127.0.0.1:8000",
+    depuis caddy : "Connection refused". Zurich 79.127.184.193, port
+    39175 transmis à qBittorrent.
+
+Partie 2 - script + minuterie (par Claude) :
+  surveillance/surveillance-port.sh, arbre de décision (n'agit que si le
+  problème ne se répare pas seul) :
+    0. sauvegarde.service en cours (elle arrête qbit exprès) -> rien
+       (ActiveState "activating" pendant un oneshot, pas "active")
+    1. gluetun pas running / pas healthy / tunnel pas "running" -> rien
+       (Gluetun se répare seul ; on ne se bat pas avec lui)
+    2. qbittorrent "created" (jamais démarré, cas du bug 4) -> docker
+       start ; "exited" (arrêt volontaire) -> rien
+    3. aucun port : attendre 60 s, revérifier ; toujours rien -> relance
+       du tunnel par l'API (stopped puis running = nouveau tirage de
+       serveur), au plus 1 fois / 15 min (date dans /var/lib/
+       surveillance-port/derniere-relance, via StateDirectory=)
+    4. port qBittorrent différent -> setPreferences, puis vérification
+    Toutes les requêtes passent par "docker exec gluetun wget" (seul
+    endroit d'où 127.0.0.1:8000 répond). Le script ne touche JAMAIS au
+    pare-feu.
+  surveillance-port.service : oneshot, User=saaos (groupe docker),
+    StateDirectory, TimeoutStartSec=5min
+  surveillance-port.timer : OnBootSec=5min, OnUnitActiveSec=5min
+  bash -n et systemd-analyze verify : aucune erreur.
+
+Tests (lancement à la main) :
+  a) Normal : "OK : port 39175 (Gluetun = qBittorrent)." en 0,26 s.
+  b) Panne simulée : port qBittorrent forcé à 12345 ->
+     "qBittorrent écoute sur 12345 au lieu de 39175 : correction."
+     "Corrigé : 39175."
+  c) Relance du tunnel par l'API (commandes du script) :
+     PUT stopped -> {"outcome":"stopped"} ; PENDANT l'arrêt, depuis
+     qbittorrent : curl IPv4 et IPv6 -> AUCUNE réponse (kill switch OK) ;
+     PUT running -> en 9 s : Zurich 185.159.157.75, port 62043, transmis
+     (200) ; passage suivant : "OK : port 62043".
+Installation (par l'utilisateur) :
+  sudo cp ~/serveur-maison/surveillance/surveillance-port.{service,timer} \
+          /etc/systemd/system/
+    ({service,timer} = expansion d'accolades : bash écrit les 2 noms)
+  sudo systemctl daemon-reload && sudo systemctl enable --now surveillance-port.timer
+    (on active la MINUTERIE ; c'est elle qui lance le service)
+Vérification (par Claude) :
+  systemctl list-timers surveillance-port.timer -> prochain passage dans
+    5 min, dernier à 18:18:41 ; is-enabled = enabled
+  systemctl show surveillance-port.service -> Result=success, statut 0
+  journalctl -u surveillance-port -> "OK : port 62043 (Gluetun = qBittorrent)."
+  /var/lib/surveillance-port créé par systemd, propriétaire saaos.
+  Consulter plus tard :
+    journalctl -u surveillance-port --since today | grep -v "OK :"
+    (= uniquement les passages où il s'est passé quelque chose)
+ETAPE 16 TERMINEE.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 17 - Routine de mises à jour
+--------------------------------------------------------------------------
+Etat des lieux :
+  Debian 13.7, noyau 6.12.116 ; unattended-upgrades NON installé.
+  Dépôts : Debian (trixie, trixie-security, trixie-updates), Docker,
+    Tailscale. En attente : docker-compose-plugin 5.7.0 -> 5.7.1.
+  Images : caddy 5 j, duckdns 2 j, qbittorrent 3 j, jellyfin 2 sem.,
+    navidrome 6 sem., gluetun 3 mois. Disque système : 6 % utilisé.
+
+Stratégie (une méthode par type de mise à jour) :
+  - Sécurité Debian       : AUTOMATIQUE chaque nuit (unattended-upgrades).
+  - Paquets Docker/Tailscale : MANUEL, mensuel. Mettre Docker à jour le
+    redémarre, donc TOUS les conteneurs : la nuit sans surveillance =
+    risque (cf. bug 4, qbittorrent resté "created").
+  - Images des conteneurs : MANUEL, mensuel, par script : sauvegarde
+    fraîche exigée avant, vérification après, retour arrière possible.
+  - Redémarrage (nouveau noyau) : MANUEL (Automatic-Reboot "false").
+
+Fichiers (par Claude) :
+  apt/20auto-upgrades   -> /etc/apt/apt.conf.d/  (active : listes 1x/jour,
+                           installation 1x/jour, autoclean 7 j)
+  apt/52serveur-maison  -> /etc/apt/apt.conf.d/  (nos réglages, lus APRÈS
+                           50unattended-upgrades du paquet, qu'on ne touche
+                           pas : pas de redémarrage auto, suppression des
+                           vieux noyaux, MinimalSteps = petits lots en cas
+                           de coupure de courant). Origines : celles par
+                           défaut de Debian -> Docker/Tailscale exclus.
+  maintenance/mise-a-jour.sh (sans sudo), étapes :
+    1. refuse si sauvegarde en cours / disque absent / dernière
+       sauvegarde > 26 h (lue par restic snapshots --no-lock --latest 1)
+    2. docker image prune -f : supprime les images remplacées lors de la
+       mise à jour PRÉCÉDENTE (gardées 1 mois pour le retour arrière)
+    3. note service / image / ID dans ~/.local/state/mise-a-jour/
+    4. docker compose pull   5. docker compose up -d + attente (Gluetun
+       healthy, tout "running" ; relance qbittorrent si "created")
+    6. bilan : mis à jour / inchangé + commande de retour arrière :
+       docker tag <ancien ID> <image> && docker compose up -d <service>
+    7. attend le port VPN puis lance surveillance-port.sh
+    8. paquets APT en attente + /var/run/reboot-required
+  Tests : bash -n OK ; date restic "2026-11-11T16:49:13.947185498+01:00"
+    convertie correctement par date -d.
+Installation (par l'utilisateur) :
+  sudo apt update && sudo apt install unattended-upgrades   (v2.12)
+  sudo cp ~/serveur-maison/apt/{20auto-upgrades,52serveur-maison} /etc/apt/apt.conf.d/
+  sudo unattended-upgrade --dry-run --debug 2>&1 | tail -n 25
+Vérification (par Claude) :
+  apt-config dump = configuration FINALE fusionnée : APT::Periodic à 1/1/7,
+    Automatic-Reboot "false", Remove-Unused-* "true", MinimalSteps "true",
+    Origins-Pattern = Debian + Debian-Security uniquement.
+  Journal du dry-run (sg adm -c ... /var/log/unattended-upgrades/) :
+    "Checking: docker-compose-plugin=5.7.1 ... origin:'Docker'"
+    "adjusting candidate to version ...5.7.0" -> dépôt Docker NON
+    autorisé : la nouvelle version est écartée (preuve que l'exclusion
+    marche). InstCount=0 (Debian à jour).
+  apt-daily-upgrade.timer : 1er vrai passage jeu. 12/11 ~06h50
+    (après la sauvegarde de 04h30).
+1re exécution réelle de maintenance/mise-a-jour.sh : code retour 0.
+  Sauvegarde vieille de 1 h 37 -> accepté ; 6 images téléchargées ;
+  0 mise à jour : jellyfin 12.4, navidrome 0.64.2, caddy v2.11.9,
+  gluetun v3.41.3, qbittorrent 5.3.0_v2.1.2-ls487 sont les dernières
+  versions publiées (une image "vieille de 3 mois" = date de
+  construction, pas forcément en retard). Port VPN OK (62043).
+  En attente : docker-compose-plugin 5.7.1 -> sudo apt full-upgrade
+  (le plugin seul : ne redémarre PAS le démon Docker).
+  Non testé en vrai : le retour arrière (aucune image n'a changé).
+Partie manuelle (par l'utilisateur) : sudo apt update && sudo apt full-upgrade
+  Vérifié : docker-compose-plugin 5.7.1, "Docker Compose version v5.7.1",
+  0 paquet en attente, pas de redémarrage requis, 6 conteneurs running.
+
+Rappel des tâches manuelles (choix de l'utilisateur : message à la
+connexion, rien ne sort du serveur ; notification iPhone écartée) :
+  maintenance/mise-a-jour.sh : écrit en fin d'exécution réussie
+    date +%s > ~/.local/state/mise-a-jour/derniere-execution
+    (repère écrit à la main pour la 1re exécution du 11/11 18h26)
+  maintenance/rappel-connexion.sh (lecture seule, ~0,23 s), signale :
+    1. routine non lancée depuis >= 30 jours
+    2. /var/run/reboot-required (redémarrage demandé + paquets)
+    3. paquets APT en attente (Docker, Tailscale)
+    4. services systemd en échec (ex. sauvegarde ratée)
+    sinon une ligne verte "Tout est à jour".
+  Tests : cas normal -> ligne verte ; repère à "34 days ago" ->
+    "Routine de mise à jour faite il y a 34 jours -> ..." ; repère remis.
+  Branchement dans ~/.bashrc : refusé à Claude (fichier exécuté à chaque
+    connexion = sensible) -> fait par l'utilisateur avec nano.
+  Branchement (par l'utilisateur) : nano ~/.bashrc, ajout en fin :
+    [ -x ~/serveur-maison/maintenance/rappel-connexion.sh ] && ~/serveur-maison/maintenance/rappel-connexion.sh
+    ([ -x f ] = existe ET exécutable ; && = seulement si le test réussit
+     -> script déplacé/supprimé = connexion sans erreur)
+  source ~/.bashrc -> "[serveur] Tout est à jour, aucun service en échec."
+ETAPE 17 TERMINEE.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 18 - Test de redémarrage complet (résilience)
+--------------------------------------------------------------------------
+But : vérifier que tout repart SEUL après un redémarrage (coupure de
+  courant, mise à jour du noyau...). Redémarrage lancé par l'utilisateur.
+
+Contrôles après le boot (18:36) (par Claude, lecture seule) :
+  OK : disques /mnt/medias et /mnt/telechargements montés (18:36:08,
+       avant Docker) ; veille masquée ; capot ignoré ; aucun service
+       systemd en échec ; timers sauvegarde/apt/surveillance-port
+       programmés ; Tailscale connecté.
+  KO : 5 conteneurs sur 6 "Exited (128)" ; seul duckdns tournait.
+
+BUG 6 : conteneurs non démarrés au boot "cannot assign requested address"
+  docker inspect -f '{{.State.Error}}' caddy :
+    "failed to bind host port 192.168.1.28:80/tcp: cannot assign
+     requested address"
+  -> nos ports sont publiés sur 192.168.1.28 uniquement (choix de
+     sécurité), et Docker a démarré AVANT que la carte Ethernet ait
+     reçu cette adresse : impossible d'écouter sur une adresse absente.
+  Chronologie (journalctl -b) :
+    18:36:07.92  network-online.target atteint ("réseau prêt" : FAUX)
+    18:36:08.08  ifup@enx0050b6cd50ce démarre (dhcpcd : "waiting for
+                 carrier")
+    18:36:08.35  docker.service démarre -> 18:36:09.8 échec des ports
+  Cause : dans /etc/network/interfaces, l'interface du dock USB est en
+    "allow-hotplug" (montée par udev quand le matériel apparaît) et le
+    service qui fait ATTENDRE network-online.target,
+    ifupdown-wait-online.service (/usr/lib/ifupdown/wait-online.sh),
+    est "disabled" sur cette installation -> la consigne
+    After=network-online.target de Docker ne protégeait rien.
+  Aggravant : la politique "unless-stopped" relance un conteneur qui
+    S'ARRÊTE, pas un conteneur qui n'a jamais réussi à démarrer.
+  Réparation immédiate (par Claude) : docker compose up -d
+    -> navidrome, jellyfin, caddy OK ; gluetun redémarre en boucle :
+
+BUG 7 : gluetun "ERROR default route not found: in 3 route(s)"
+  docker inspect -f '{{json .NetworkSettings.Networks}}' gluetun -> {}
+  Cause : le démarrage raté a laissé le conteneur SANS raccordement au
+    réseau Docker ; gluetun ne trouve pas de route -> s'arrête (sûr :
+    pas de route = pas de trafic, le kill switch a tenu ; qbittorrent,
+    dépendant de "service_healthy", n'a jamais démarré).
+  Correction (par Claude) :
+    docker compose up -d --force-recreate gluetun qbittorrent
+    (--force-recreate = jette le conteneur et le reconstruit d'après
+     compose.yaml ; les données sont dans des volumes -> rien de perdu)
+  Vérifié : gluetun healthy ; IP de sortie de qbittorrent 212.104.214.155
+    (CH) ≠ IP de la box ; IPv6 depuis qbittorrent : "Address not
+    available" (bloqué) ; script de redirection de port exécuté.
+
+Entre-temps (par l'utilisateur) : activation de ifupdown-wait-online.service
+  (sudo systemctl enable ifupdown-wait-online.service), puis 2e redémarrage.
+
+2e redémarrage (boot 18:41) - contrôle par Claude :
+  KO : gluetun + qbittorrent "Exited (128)" ("failed to bind host port
+       192.168.1.28:8080/tcp: cannot assign requested address").
+  PIRE : caddy, jellyfin, navidrome affichés "Up" mais SANS AUCUN PORT
+       (docker ps : colonne Ports vide ; ss -ltn : rien sur 80/443/8096/
+       4533 ; curl http://192.168.1.28:8096 -> échec). Panne SILENCIEUSE :
+       "Up" ne veut pas dire "joignable".
+  Chronologie (journalctl -b -o short-precise) :
+    18:41:19.25  dhcpcd : "waiting for carrier" (câble pas encore actif)
+    18:41:19.92  ifupdown-wait-online TERMINÉ  <- n'a rien attendu
+    18:41:19.93  docker démarre ; 18:41:21.3 échec du port 8080
+    18:41:24.31  la box donne 192.168.1.28   <- 4,4 s trop tard
+  Cause (lecture de /usr/lib/ifupdown/wait-online.sh) : méthode par défaut
+    WAIT_ONLINE_METHOD=ifup = attendre que ifup ait "pris en charge"
+    l'interface (ifquery --state), PAS qu'elle ait une adresse. dhcpcd
+    passe en arrière-plan dès le lancement -> attente quasi nulle.
+  Réparation immédiate (par Claude) :
+    docker compose up -d --force-recreate
+    Vérifié : 6 conteneurs Up, ports 80/443/8096/4533/8080 en écoute sur
+    192.168.1.28, IP de sortie qbittorrent 212.104.214.155 (VPN) ≠ IP box.
+  Après le reboot (à la demande de l'utilisateur) : extinction de l'écran
+    de tty1 de nouveau désactivée (le réglage de 15h15 ne survit pas à un
+    redémarrage) : setterm --term linux --blank 0 > /dev/tty1
+
+--------------------------------------------------------------------------
+2026-11-11 18:57 — REBOOT DE VALIDATION (correctif WAIT_ONLINE_METHOD=route)
+--------------------------------------------------------------------------
+  But : vérifier qu'après un redémarrage tout repart SANS intervention.
+  Chronologie du boot (journalctl -b) :
+    18:56:04.19  ifupdown-wait-online démarre
+    18:56:12.56  ifupdown-wait-online TERMINÉ  <- a réellement attendu 8,4 s
+    18:56:12.57  docker démarre APRÈS le réseau  -> plus d'échec du port 8080
+  Contrôles (faits par Claude) :
+    - docker ps : 6 conteneurs Up ; gluetun et jellyfin "healthy".
+    - Disques : /mnt/medias (sdc1) et /mnt/telechargements (sdb1) montés.
+    - Gluetun : 1 redémarrage automatique du tunnel au démarrage (DNS pas
+      encore prêt, "i/o timeout"), puis OK à 18:56:30. Comportement normal :
+      c'est le kill switch qui fait son travail.
+    - IP de sortie qbittorrent : 79.127.184.164 (Proton, Datapacket) ≠ IP box.
+      (Les bases de géolocalisation se contredisent : Suisse pour gluetun,
+      Tchéquie pour ifconfig.co. Sans importance, c'est bien Proton.)
+    - IPv6 depuis qbittorrent : échec = pas de fuite.
+    - Port redirigé Proton 39991 = Session\Port de qBittorrent. OK.
+    - HTTPS Jellyfin et Navidrome depuis l'extérieur : réponse 302, TLS OK.
+    - Tailscale : connecté. Veille : sleep/suspend.target "masked".
+  Remarque bug outil : "wget -6" n'existe pas dans le wget BusyBox du
+    conteneur, et ipinfo.io renvoie une réponse vide -> utiliser curl
+    vers ifconfig.co pour les tests.
+  Point restant : consoleblank=60 -> l'écran de tty1 se remet en veille
+    à chaque boot (le setterm n'est pas permanent). Correctif permanent
+    possible : paramètre noyau consoleblank=0 dans GRUB.
+
+--------------------------------------------------------------------------
+[2026-11-11] ETAPE 19 - Dépôt GitHub
+--------------------------------------------------------------------------
+19.1 Audit des secrets avant publication (Claude)
+  - Recherche de token/password/private_key/secret dans tous les fichiers :
+    seules des RÉFÉRENCES (${DUCKDNS_TOKEN}, ${WIREGUARD_PRIVATE_KEY},
+    RESTIC_PASSWORD_FILE=chemin) ; les valeurs sont dans .env ou
+    ~/.config/restic (hors du dossier).
+  - IP publique de la box et sous-domaines DuckDNS : absents (masqués
+    83.115.x.x / xxx.duckdns.org depuis le début).
+  - IP Tailscale (100.x.x.x) présentes : sans risque, elles ne sont
+    joignables que depuis les appareils du tailnet.
+19.2 Fichiers préparés (Claude)
+  - .env.exemple : modèle vide du .env (permet de reconstruire le serveur).
+  - .gitignore renforcé : .env, *.key, *.pem, mot-de-passe*, *.swp, *~
+  - README.md : présentation, matériel, architecture, étapes.
+19.3 git init -b main ; git add -A
+  Vérifié avec "git status --short --ignored" : 22 fichiers suivis,
+  .env bien ignoré (!!).

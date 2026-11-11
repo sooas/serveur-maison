@@ -1,0 +1,30 @@
+# ==========================================================================
+#  Prison fail2ban : protège Jellyfin et Navidrome derrière Caddy
+# ==========================================================================
+# [DEFAULT] = s'applique à TOUTES les prisons (dont "sshd", activée par
+# Debian) : jamais bannis = la machine, le réseau maison, Docker, Tailscale
+[DEFAULT]
+ignoreip = 127.0.0.1/8 192.168.1.0/24 172.16.0.0/12 100.64.0.0/10
+
+[caddy-auth]
+enabled  = true
+filter   = caddy-auth
+# Debian lit par défaut le journal système (systemd) : ici c'est un FICHIER
+backend  = auto
+logpath  = /srv/appdata/caddy/logs/access.log
+
+# 5 échecs en 10 minutes -> banni 1 heure ; récidive -> durée doublée
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+
+# Le trafic vers les conteneurs traverse FORWARD, pas INPUT : on bannit
+# dans la chaîne DOCKER-USER, prévue par Docker pour nos propres règles.
+# ATTENTION : "chain" doit être un réglage de la PRISON. Ecrit entre
+# crochets dans banaction, il est écrasé par la valeur par défaut (INPUT)
+# -> bannissement sans effet (bug 3 du 2026-11-11).
+banaction = iptables-multiport
+chain     = DOCKER-USER
+port      = http,https

@@ -1,0 +1,10 @@
+[Unit]
+Description=Sauvegarde quotidienne a 04h30
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Si le serveur était éteint à 04h30, rattraper au démarrage
+Persistent=true
+
+[Install]
+WantedBy=timers.target

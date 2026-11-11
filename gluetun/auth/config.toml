@@ -1,0 +1,20 @@
+# ==========================================================================
+#  Gluetun - droits d'accès au serveur de contrôle (port 8000)
+#  Monté en lecture seule dans le conteneur : /gluetun/auth/config.toml
+# ==========================================================================
+# Le serveur de contrôle n'écoute QUE sur 127.0.0.1 (voir compose.yaml,
+# HTTP_CONTROL_SERVER_ADDRESS) : seuls Gluetun et qBittorrent (même réseau)
+# peuvent le joindre. D'où auth = "none" : pas de mot de passe à gérer.
+#
+# On liste EXPLICITEMENT les routes utilisées par la surveillance du port :
+# une route non listée sera refusée quand Gluetun bloquera par défaut
+# (annoncé pour la v4), au lieu de casser la surveillance sans prévenir.
+
+[[roles]]
+name   = "surveillance-port"
+routes = [
+  "GET /v1/portforward",   # port obtenu auprès de Proton
+  "GET /v1/vpn/status",    # tunnel "running" ou "stopped"
+  "PUT /v1/vpn/status",    # arrêter / relancer le tunnel (nouveau serveur)
+]
+auth   = "none"

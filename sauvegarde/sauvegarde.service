@@ -1,0 +1,14 @@
+[Unit]
+Description=Sauvegarde restic du serveur maison
+# Le disque de sauvegarde doit être monté, Docker démarré
+RequiresMountsFor=/mnt/telechargements
+After=docker.service
+
+[Service]
+Type=oneshot
+User=saaos
+Group=saaos
+ExecStart=/home/saaos/serveur-maison/sauvegarde/sauvegarde.sh
+# Priorité basse : ne pas gêner un film en cours
+Nice=10
+IOSchedulingClass=idle

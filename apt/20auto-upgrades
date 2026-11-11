@@ -1,0 +1,10 @@
+// ==========================================================================
+//  APT : ACTIVE les mises à jour automatiques (unattended-upgrades)
+//  À installer dans /etc/apt/apt.conf.d/20auto-upgrades
+//  Exécutées par les minuteries Debian apt-daily.timer (télécharge) et
+//  apt-daily-upgrade.timer (installe, vers 6 h).
+//  (Dans les fichiers APT, les commentaires commencent par //)
+// ==========================================================================
+APT::Periodic::Update-Package-Lists "1";   // apt update : tous les 1 jour
+APT::Periodic::Unattended-Upgrade "1";     // installation : tous les 1 jour
+APT::Periodic::AutocleanInterval "7";      // vide le cache des .deb : 7 jours
